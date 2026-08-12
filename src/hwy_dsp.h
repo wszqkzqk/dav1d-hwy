@@ -36,6 +36,8 @@
 #include "src/loopfilter.h"
 #include "src/looprestoration.h"
 #include "src/mc.h"
+#include "src/pal.h"
+#include "src/refmvs.h"
 
 /* Google Highway based DSP functions (src/hwy/), dispatched at runtime to
  * the best SIMD target. Install before the architecture-specific asm init,
@@ -48,5 +50,7 @@ bitfn_decls(void dav1d_loop_filter_dsp_init_hwy, Dav1dLoopFilterDSPContext *c);
 bitfn_decls(void dav1d_loop_restoration_dsp_init_hwy, Dav1dLoopRestorationDSPContext *c);
 bitfn_decls(void dav1d_mc_dsp_init_hwy, Dav1dMCDSPContext *c);
 bitfn_decls(void dav1d_mc_compound_dsp_init_hwy, Dav1dMCDSPContext *c);
+void dav1d_pal_dsp_init_hwy(Dav1dPalDSPContext *c);
+void dav1d_refmvs_dsp_init_hwy(Dav1dRefmvsDSPContext *c);
 
 #endif /* DAV1D_SRC_HWY_DSP_H */

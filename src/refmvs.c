@@ -36,7 +36,12 @@
 
 #include "src/env.h"
 #include "src/mem.h"
+#include "src/cpu.h"
 #include "src/refmvs.h"
+
+#if HAVE_HIGHWAY
+#include "src/hwy_dsp.h"
+#endif
 
 static void add_spatial_candidate(refmvs_candidate *const mvstack, int *const cnt,
                                   const int weight, const refmvs_block *const b,
@@ -927,6 +932,16 @@ COLD void dav1d_refmvs_dsp_init(Dav1dRefmvsDSPContext *const c)
     c->load_tmvs = load_tmvs_c;
     c->save_tmvs = save_tmvs_c;
     c->splat_mv = splat_mv_c;
+
+#if HAVE_HIGHWAY
+    /* Portable SIMD versions, dispatched at runtime to the best SIMD target;
+     * the asm init below still takes precedence where it exists. Skipped when
+     * all cpu flags are masked off (checkasm's C reference pass). */
+#if HAVE_ASM
+    if (dav1d_get_cpu_flags())
+#endif
+        dav1d_refmvs_dsp_init_hwy(c);
+#endif
 
 #if HAVE_ASM
 #if ARCH_AARCH64 || ARCH_ARM

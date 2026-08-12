@@ -31,7 +31,12 @@
 
 #include "common/attributes.h"
 
+#include "src/cpu.h"
 #include "src/pal.h"
+
+#if HAVE_HIGHWAY
+#include "src/hwy_dsp.h"
+#endif
 
 // fill invisible edges and pack to 4-bit (2 pixels per byte)
 static void pal_idx_finish_c(uint8_t *dst, const uint8_t *src,
@@ -70,6 +75,16 @@ static void pal_idx_finish_c(uint8_t *dst, const uint8_t *src,
 
 COLD void dav1d_pal_dsp_init(Dav1dPalDSPContext *const c) {
     c->pal_idx_finish = pal_idx_finish_c;
+
+#if HAVE_HIGHWAY
+    /* Portable SIMD versions, dispatched at runtime to the best SIMD target;
+     * the asm init below still takes precedence where it exists. Skipped when
+     * all cpu flags are masked off (checkasm's C reference pass). */
+#if HAVE_ASM
+    if (dav1d_get_cpu_flags())
+#endif
+        dav1d_pal_dsp_init_hwy(c);
+#endif
 
 #if HAVE_ASM
 #if ARCH_RISCV
