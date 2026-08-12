@@ -27,7 +27,8 @@
 // Motion compensation put/prep kernels (src/mc_tmpl.c) implemented with
 // Google Highway: one source is compiled per SIMD target and the best one
 // supported by the CPU is selected at runtime (HWY_DYNAMIC_DISPATCH).
-// Bit-exact with the C code; scaled variants and warp8x8 are not covered.
+// Covers the plain and scaled (reference-scaling) variants and the warp8x8
+// kernels. Bit-exact with the C code.
 //
 // Vectors are capped at 128 bits so that MulEven/MulOdd (i16 -> i32 widening
 // multiplies) and the InterleaveLower/Upper + Combine recombination are
@@ -38,6 +39,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <type_traits>
 
 #undef HWY_TARGET_INCLUDE
@@ -48,6 +50,7 @@
 
 // Defined in src/tables.c.
 extern "C" const int8_t dav1d_mc_subpel_filters[6][15][8];
+extern "C" const int8_t dav1d_mc_warp_filter[193][8];
 
 HWY_BEFORE_NAMESPACE();
 
@@ -402,6 +405,192 @@ static HWY_INLINE hn::VFromD<D16> BilinDot(const D16 d, const Src *const p,
 // filter tables have F[0] == F[7] == 0 for every subpel position.
 static HWY_INLINE bool tap_6(const int8_t *const F) {
     return F[0] == 0 && F[7] == 0;
+}
+
+// Phase 0 of the scaled horizontal pass takes the unfiltered path in C
+// (src[ioff] << intermediate_bits); a delta tap row reproduces it exactly
+// through the dot path: (64 * px + ((1 << (6 - ib)) >> 1)) >> (6 - ib) ==
+// px << ib.
+alignas(8) const int8_t kDeltaTaps[8] = { 0, 0, 0, 64, 0, 0, 0, 0 };
+
+// 8x8 i16 transpose via three levels of interleaves (i16, then i32, then
+// i64 lanes).
+template <class D16>
+static HWY_INLINE void Transpose8x8I16(const D16 d,
+                                       const hn::VFromD<D16> in[8],
+                                       hn::VFromD<D16> out[8]) {
+    const hn::Repartition<int32_t, D16> d32;
+    const hn::Repartition<int64_t, D16> d64;
+    hn::VFromD<D16> t[8], u[8];
+    for (int i = 0; i < 4; i++) {
+        t[2 * i + 0] = hn::InterleaveLower(in[2 * i], in[2 * i + 1]);
+        t[2 * i + 1] = hn::InterleaveUpper(d, in[2 * i], in[2 * i + 1]);
+    }
+    for (int i = 0; i < 2; i++) {
+        u[i + 0] = hn::BitCast(d, hn::InterleaveLower(
+            d32, hn::BitCast(d32, t[i]), hn::BitCast(d32, t[i + 2])));
+        u[i + 2] = hn::BitCast(d, hn::InterleaveLower(
+            d32, hn::BitCast(d32, t[i + 4]), hn::BitCast(d32, t[i + 6])));
+        u[i + 4] = hn::BitCast(d, hn::InterleaveUpper(
+            d32, hn::BitCast(d32, t[i]), hn::BitCast(d32, t[i + 2])));
+        u[i + 6] = hn::BitCast(d, hn::InterleaveUpper(
+            d32, hn::BitCast(d32, t[i + 4]), hn::BitCast(d32, t[i + 6])));
+    }
+    // u[] lanes: u0 = cols 0/1 rows 0-3, u2 = cols 0/1 rows 4-7, u1/u3 the
+    // same for cols 4/5, u4..u7 for cols 2/3 and 6/7.
+    using V64 = hn::VFromD<decltype(d64)>;
+    const V64 u0 = hn::BitCast(d64, u[0]);
+    const V64 u1 = hn::BitCast(d64, u[1]);
+    const V64 u2 = hn::BitCast(d64, u[2]);
+    const V64 u3 = hn::BitCast(d64, u[3]);
+    const V64 u4 = hn::BitCast(d64, u[4]);
+    const V64 u5 = hn::BitCast(d64, u[5]);
+    const V64 u6 = hn::BitCast(d64, u[6]);
+    const V64 u7 = hn::BitCast(d64, u[7]);
+    out[0] = hn::BitCast(d, hn::InterleaveLower(d64, u0, u2));
+    out[1] = hn::BitCast(d, hn::InterleaveUpper(d64, u0, u2));
+    out[2] = hn::BitCast(d, hn::InterleaveLower(d64, u4, u6));
+    out[3] = hn::BitCast(d, hn::InterleaveUpper(d64, u4, u6));
+    out[4] = hn::BitCast(d, hn::InterleaveLower(d64, u1, u3));
+    out[5] = hn::BitCast(d, hn::InterleaveUpper(d64, u1, u3));
+    out[6] = hn::BitCast(d, hn::InterleaveLower(d64, u5, u7));
+    out[7] = hn::BitCast(d, hn::InterleaveUpper(d64, u5, u7));
+}
+
+// Transposed tap matrix for per-column filters: ft[k] holds tap k of the 8
+// column filters, so a per-column dot is MulEven/MulOdd(v, ft[k]) with the
+// column index as the lane. rows are 8-byte filter rows (the tables in
+// src/tables.c, or kDeltaTaps).
+template <class D16>
+static HWY_INLINE void LoadTapsT(const D16 d, const int8_t *const rows[8],
+                                 hn::VFromD<D16> ft[8]) {
+    const hn::CappedTag<int8_t, 8> d8;
+    hn::VFromD<D16> r[8];
+    for (int j = 0; j < 8; j++)
+        r[j] = hn::PromoteTo(d, hn::LoadU(d8, rows[j]));
+    Transpose8x8I16(d, r, ft);
+}
+
+// Source offset (ioff) and filter phase (imx >> 6) of every output column of
+// the scaled kernels, from the C accumulation imx += dx; ioff += imx >> 10;
+// imx &= 0x3ff. Identical on every horizontally filtered row of a call.
+static HWY_INLINE void ScaledHOffsets(const int w, const int mx, const int dx,
+                                      int32_t *const ioff,
+                                      uint8_t *const phase) {
+    int imx = mx, io = 0;
+    for (int x = 0; x < w; x++) {
+        phase[x] = (uint8_t) (imx >> 6);
+        ioff[x] = io;
+        imx += dx;
+        io += imx >> 10;
+        imx &= 0x3ff;
+    }
+}
+
+// Per-call horizontal geometry of the 8-tap scaled kernels: per 8-column
+// chunk, the window offsets and the transposed per-column tap matrix. Lanes
+// past w repeat the last real output column, keeping the window loads inside
+// the range the C code reads; their results land in unused mid columns.
+// Returns the chunk count.
+template <class D16>
+static HWY_INLINE int ScaledHInit(const D16 d, const int w, const int mx,
+                                  const int dx, const int filter_type,
+                                  int32_t off[16][8],
+                                  hn::VFromD<D16> taps[16][8]) {
+    const int table = w > 4 ? (filter_type & 3) : (3 + (filter_type & 1));
+    int32_t ioff[128];
+    uint8_t phase[128];
+    ScaledHOffsets(w, mx, dx, ioff, phase);
+    const int n = (w + 7) >> 3;
+    for (int c = 0; c < n; c++) {
+        const int8_t *rows[8];
+        for (int j = 0; j < 8; j++) {
+            const int x = 8 * c + j < w ? 8 * c + j : w - 1;
+            off[c][j] = ioff[x];
+            rows[j] = phase[x] ? dav1d_mc_subpel_filters[table][phase[x] - 1]
+                               : kDeltaTaps;
+        }
+        LoadTapsT(d, rows, taps[c]);
+    }
+    return n;
+}
+
+// Same, for the bilinear scaled kernels: per-lane constant pairs holding
+// interleaved 16 - m / m multipliers (m = imx >> 6) instead of tap matrices.
+template <class D16>
+static HWY_INLINE int ScaledHInitBilin(const D16 d, const int w, const int mx,
+                                       const int dx, int32_t off[16][8],
+                                       hn::VFromD<D16> cm[16][2]) {
+    int32_t ioff[128];
+    uint8_t phase[128];
+    ScaledHOffsets(w, mx, dx, ioff, phase);
+    const int n = (w + 7) >> 3;
+    for (int c = 0; c < n; c++) {
+        alignas(16) int16_t cb[16];
+        for (int j = 0; j < 8; j++) {
+            const int x = 8 * c + j < w ? 8 * c + j : w - 1;
+            off[c][j] = ioff[x];
+            cb[2 * j] = 16 - phase[x];
+            cb[2 * j + 1] = phase[x];
+        }
+        cm[c][0] = hn::Load(d, cb);
+        cm[c][1] = hn::Load(d, cb + 8);
+    }
+    return n;
+}
+
+// One horizontally filtered row of the 8-tap scaled kernels into a mid row:
+// (sum_k taps[k][col] * srow[off(col) - 3 + k] + rnd) >> sh. Each window load
+// reads srow[off - 3 .. off + 4], exactly the C footprint of that output.
+template <class D16, typename Pixel>
+static HWY_INLINE void ScaledHRow8tap(const D16 d, const Pixel *const srow,
+                                      const int32_t off[16][8],
+                                      const hn::VFromD<D16> taps[16][8],
+                                      const int nch, int16_t *const mrow,
+                                      const int rnd, const int sh) {
+    const hn::Repartition<int32_t, D16> d32;
+    for (int c = 0; c < nch; c++) {
+        hn::VFromD<D16> w8[8], mt[8];
+        for (int j = 0; j < 8; j++)
+            w8[j] = LoadI16<8>(d, srow + off[c][j] - 3, 8);
+        Transpose8x8I16(d, w8, mt);
+        auto de0 = hn::Zero(d32), de1 = hn::Zero(d32);
+        auto do0 = hn::Zero(d32), do1 = hn::Zero(d32);
+        for (int k = 0; k < 8; k++) {
+            auto& de = (k & 1) ? de1 : de0;
+            auto& dout = (k & 1) ? do1 : do0;
+            de = hn::Add(de, hn::MulEven(mt[k], taps[c][k]));
+            dout = hn::Add(dout, hn::MulOdd(mt[k], taps[c][k]));
+        }
+        StoreI16<8>(d, mrow + 8 * c, 8,
+                    RoundPack(d, hn::Add(de0, de1), hn::Add(do0, do1), rnd, sh));
+    }
+}
+
+// Same, bilinear: per output, the exact C footprint (src[ioff], src[ioff+1])
+// is read as one packed 2-pixel scalar load, so lanes alternate s0/s1 and
+// (16 - m) * s0 + m * s1 == MulEven(v, cm) + MulOdd(v, cm) with cm holding
+// interleaved 16 - m / m pairs. (16 - m) * s0 + m * s1 <= 16 * 4095.
+template <class D16, typename Pixel>
+static HWY_INLINE void ScaledHRowBilin(const D16 d, const Pixel *const srow,
+                                       const int32_t off[16][8],
+                                       const hn::VFromD<D16> cm[16][2],
+                                       const int nch, int16_t *const mrow,
+                                       const int rnd, const int sh) {
+    using BP = typename std::conditional<sizeof(Pixel) == 1, uint16_t,
+                                         uint32_t>::type;
+    for (int c = 0; c < nch; c++) {
+        alignas(16) BP pairs[8];
+        for (int j = 0; j < 8; j++)
+            memcpy(&pairs[j], srow + off[c][j], sizeof(BP));
+        for (int hf = 0; hf < 2; hf++) {
+            const auto v = LoadI16<8>(d, reinterpret_cast<const Pixel *>(pairs)
+                                      + 8 * hf, 8);
+            const auto dot = hn::Add(hn::MulEven(v, cm[c][hf]),
+                                     hn::MulOdd(v, cm[c][hf]));
+            StorePackI16x4(dot, rnd, sh, mrow + 8 * c + 4 * hf);
+        }
+    }
 }
 
 // put_c from src/mc_tmpl.c.
@@ -1022,6 +1211,313 @@ static void hwy_prep_bilin_impl(int16_t *tmp, const Pixel *const src,
     else run(std::false_type{});
 }
 
+// put_8tap_scaled_c from src/mc_tmpl.c. The C ring of 8 mid row pointers is
+// replaced by absolute line indexing: the fill for counter in_y writes line
+// in_y + 5 (relative to the unshifted src) into row in_y & 7, so the vertical
+// pass for output row y (src_y = my >> 10) reads rows (src_y + k) & 7, and
+// the unfiltered vertical path reads row (src_y + 3) & 7.
+template <typename Pixel, int kCap>
+static void hwy_put_8tap_scaled_impl(Pixel *const dst, const ptrdiff_t dst_stride,
+                         const Pixel *const src, const ptrdiff_t src_stride,
+                         const int w, const int h, const int mx, int my,
+                         const int dx, const int dy, const int filter_type,
+                         const int bitdepth_max,
+                         const std::integral_constant<int, kCap>) {
+    const int ib = sizeof(Pixel) == 1 ? 4 : 13 - hwy_ulog2(bitdepth_max);
+    const ptrdiff_t ds = dst_stride / (ptrdiff_t) sizeof(Pixel);
+    const ptrdiff_t ss = src_stride / (ptrdiff_t) sizeof(Pixel);
+    using DT16 = hn::CappedTag<int16_t, kCap == 0 ? 8 : kCap>;
+    using DT32 = hn::Repartition<int32_t, DT16>;
+    const DT16 d;
+    const int N = (int) hn::Lanes(d);
+    int32_t hoff[16][8];
+    hn::VFromD<DT16> htaps[16][8];
+    const int nch = ScaledHInit(d, w, mx, dx, filter_type, hoff, htaps);
+
+    int16_t mid[8 * 128];
+    const Pixel *srow = src - 3 * ss;
+    Pixel *drow = dst;
+    int in_y = -8;
+    for (int y = 0; y < h; y++) {
+        const int src_y = my >> 10;
+        const int vph = (my & 0x3ff) >> 6;
+        const int8_t *const fv = !vph ? NULL :
+            dav1d_mc_subpel_filters[h > 4 ? (filter_type >> 2)
+                                          : (3 + ((filter_type >> 2) & 1))][vph - 1];
+        while (in_y < src_y) {
+            ScaledHRow8tap(d, srow, hoff, htaps, nch, mid + (in_y & 7) * 128,
+                           (1 << (6 - ib)) >> 1, 6 - ib);
+            srow += ss;
+            in_y++;
+        }
+        if (fv) {
+            hn::VFromD<DT16> vf[8]; LoadTaps(d, fv, vf);
+            const int rnd_v = (1 << (6 + ib)) >> 1;
+            for (int x = 0; x < w; x += N) {
+                const size_t n = (size_t) (w - x < N ? w - x : N);
+                hn::VFromD<DT16> rows[8];
+                for (int k = 0; k < 8; k++)
+                    rows[k] = LoadI16<kCap>(d, mid + ((src_y + k) & 7) * 128 + x, n);
+                hn::VFromD<DT32> dot_e, dot_o;
+                Dot8V<false>(d, rows, vf, dot_e, dot_o);
+                StorePackPx<kCap>(d, drow + x, n, dot_e, dot_o, rnd_v, 6 + ib,
+                                  bitdepth_max);
+            }
+        } else {
+            const int16_t *const m3 = mid + ((src_y + 3) & 7) * 128;
+            const auto vrnd = hn::Set(d, (1 << ib) >> 1);
+            const auto vmax = hn::Set(d, bitdepth_max);
+            for (int x = 0; x < w; x += N) {
+                const size_t n = (size_t) (w - x < N ? w - x : N);
+                const auto v = hn::ShiftRightSame(
+                    hn::Add(LoadI16<kCap>(d, m3 + x, n), vrnd), ib);
+                StorePx<kCap>(d, drow + x, n, hn::Clamp(v, hn::Zero(d), vmax));
+            }
+        }
+        my += dy;
+        drow += ds;
+    }
+}
+
+// prep_8tap_scaled_c from src/mc_tmpl.c; same structure as the put variant.
+template <typename Pixel, int kCap>
+static void hwy_prep_8tap_scaled_impl(int16_t *tmp, const Pixel *const src,
+                         const ptrdiff_t src_stride, const int w, const int h,
+                         const int mx, int my, const int dx, const int dy,
+                         const int filter_type, const int bitdepth_max,
+                         const std::integral_constant<int, kCap>) {
+    const int ib = sizeof(Pixel) == 1 ? 4 : 13 - hwy_ulog2(bitdepth_max);
+    const int prep_bias = sizeof(Pixel) == 1 ? 0 : 8192;
+    const ptrdiff_t ss = src_stride / (ptrdiff_t) sizeof(Pixel);
+    using DT16 = hn::CappedTag<int16_t, kCap == 0 ? 8 : kCap>;
+    using DT32 = hn::Repartition<int32_t, DT16>;
+    const DT16 d;
+    const int N = (int) hn::Lanes(d);
+    int32_t hoff[16][8];
+    hn::VFromD<DT16> htaps[16][8];
+    const int nch = ScaledHInit(d, w, mx, dx, filter_type, hoff, htaps);
+
+    int16_t mid[8 * 128];
+    const Pixel *srow = src - 3 * ss;
+    int16_t *trow = tmp;
+    int in_y = -8;
+    for (int y = 0; y < h; y++) {
+        const int src_y = my >> 10;
+        const int vph = (my & 0x3ff) >> 6;
+        const int8_t *const fv = !vph ? NULL :
+            dav1d_mc_subpel_filters[h > 4 ? (filter_type >> 2)
+                                          : (3 + ((filter_type >> 2) & 1))][vph - 1];
+        while (in_y < src_y) {
+            ScaledHRow8tap(d, srow, hoff, htaps, nch, mid + (in_y & 7) * 128,
+                           (1 << (6 - ib)) >> 1, 6 - ib);
+            srow += ss;
+            in_y++;
+        }
+        if (fv) {
+            hn::VFromD<DT16> vf[8]; LoadTaps(d, fv, vf);
+            for (int x = 0; x < w; x += N) {
+                const size_t n = (size_t) (w - x < N ? w - x : N);
+                hn::VFromD<DT16> rows[8];
+                for (int k = 0; k < 8; k++)
+                    rows[k] = LoadI16<kCap>(d, mid + ((src_y + k) & 7) * 128 + x, n);
+                hn::VFromD<DT32> dot_e, dot_o;
+                Dot8V<false>(d, rows, vf, dot_e, dot_o);
+                // PREP_BIAS folded into the rounding constant (exact for
+                // arithmetic shifts; result fits int16).
+                StorePackI16<kCap>(d, trow + x, n, dot_e, dot_o,
+                                   32 - (prep_bias << 6), 6);
+            }
+        } else {
+            const int16_t *const m3 = mid + ((src_y + 3) & 7) * 128;
+            const auto vbias = hn::Set(d, prep_bias);
+            for (int x = 0; x < w; x += N) {
+                const size_t n = (size_t) (w - x < N ? w - x : N);
+                StoreI16<kCap>(d, trow + x, n,
+                               hn::Sub(LoadI16<kCap>(d, m3 + x, n), vbias));
+            }
+        }
+        my += dy;
+        trow += w;
+    }
+}
+
+// put_bilin_scaled_c from src/mc_tmpl.c; 2-row ring: the fill for counter
+// in_y writes line in_y + 2 into row in_y & 1, so output row y uses rows
+// src_y & 1 and (src_y + 1) & 1.
+template <typename Pixel, int kCap>
+static void hwy_put_bilin_scaled_impl(Pixel *const dst, const ptrdiff_t dst_stride,
+                         const Pixel *const src, const ptrdiff_t src_stride,
+                         const int w, const int h, const int mx, int my,
+                         const int dx, const int dy, const int bitdepth_max,
+                         const std::integral_constant<int, kCap>) {
+    const int ib = sizeof(Pixel) == 1 ? 4 : 13 - hwy_ulog2(bitdepth_max);
+    const ptrdiff_t ds = dst_stride / (ptrdiff_t) sizeof(Pixel);
+    const ptrdiff_t ss = src_stride / (ptrdiff_t) sizeof(Pixel);
+    using DT16 = hn::CappedTag<int16_t, kCap == 0 ? 8 : kCap>;
+    using DT32 = hn::Repartition<int32_t, DT16>;
+    const DT16 d;
+    const int N = (int) hn::Lanes(d);
+    const auto v16 = hn::Set(d, 16);
+    int32_t hoff[16][8];
+    hn::VFromD<DT16> hcm[16][2];
+    const int nch = ScaledHInitBilin(d, w, mx, dx, hoff, hcm);
+
+    int16_t mid[2 * 128];
+    const Pixel *srow = src;
+    Pixel *drow = dst;
+    int in_y = -2;
+    for (int y = 0; y < h; y++) {
+        const int src_y = my >> 10;
+        const auto vdmy = hn::Set(d, (my & 0x3ff) >> 6);
+        while (in_y < src_y) {
+            ScaledHRowBilin(d, srow, hoff, hcm, nch, mid + (in_y & 1) * 128,
+                            (1 << (4 - ib)) >> 1, 4 - ib);
+            srow += ss;
+            in_y++;
+        }
+        const int16_t *const m1 = mid + (src_y & 1) * 128;
+        const int16_t *const m2 = mid + ((src_y + 1) & 1) * 128;
+        const int rnd_v = (1 << (4 + ib)) >> 1;
+        for (int x = 0; x < w; x += N) {
+            const size_t n = (size_t) (w - x < N ? w - x : N);
+            hn::VFromD<DT32> dot_e, dot_o;
+            DotBilinV(d, LoadI16<kCap>(d, m1 + x, n),
+                      LoadI16<kCap>(d, m2 + x, n), v16, vdmy, dot_e, dot_o);
+            StorePackPx<kCap>(d, drow + x, n, dot_e, dot_o, rnd_v, 4 + ib,
+                              bitdepth_max);
+        }
+        my += dy;
+        drow += ds;
+    }
+}
+
+// prep_bilin_scaled_c from src/mc_tmpl.c.
+template <typename Pixel, int kCap>
+static void hwy_prep_bilin_scaled_impl(int16_t *tmp, const Pixel *const src,
+                         const ptrdiff_t src_stride, const int w, const int h,
+                         const int mx, int my, const int dx, const int dy,
+                         const int bitdepth_max,
+                         const std::integral_constant<int, kCap>) {
+    const int ib = sizeof(Pixel) == 1 ? 4 : 13 - hwy_ulog2(bitdepth_max);
+    const int prep_bias = sizeof(Pixel) == 1 ? 0 : 8192;
+    const ptrdiff_t ss = src_stride / (ptrdiff_t) sizeof(Pixel);
+    using DT16 = hn::CappedTag<int16_t, kCap == 0 ? 8 : kCap>;
+    using DT32 = hn::Repartition<int32_t, DT16>;
+    const DT16 d;
+    const int N = (int) hn::Lanes(d);
+    const auto v16 = hn::Set(d, 16);
+    int32_t hoff[16][8];
+    hn::VFromD<DT16> hcm[16][2];
+    const int nch = ScaledHInitBilin(d, w, mx, dx, hoff, hcm);
+
+    int16_t mid[2 * 128];
+    const Pixel *srow = src;
+    int16_t *trow = tmp;
+    int in_y = -2;
+    for (int y = 0; y < h; y++) {
+        const int src_y = my >> 10;
+        const auto vdmy = hn::Set(d, (my & 0x3ff) >> 6);
+        while (in_y < src_y) {
+            ScaledHRowBilin(d, srow, hoff, hcm, nch, mid + (in_y & 1) * 128,
+                            (1 << (4 - ib)) >> 1, 4 - ib);
+            srow += ss;
+            in_y++;
+        }
+        const int16_t *const m1 = mid + (src_y & 1) * 128;
+        const int16_t *const m2 = mid + ((src_y + 1) & 1) * 128;
+        for (int x = 0; x < w; x += N) {
+            const size_t n = (size_t) (w - x < N ? w - x : N);
+            hn::VFromD<DT32> dot_e, dot_o;
+            DotBilinV(d, LoadI16<kCap>(d, m1 + x, n),
+                      LoadI16<kCap>(d, m2 + x, n), v16, vdmy, dot_e, dot_o);
+            // PREP_BIAS folded into the rounding constant (exact).
+            StorePackI16<kCap>(d, trow + x, n, dot_e, dot_o,
+                               8 - (prep_bias << 4), 4);
+        }
+        my += dy;
+        trow += w;
+    }
+}
+
+// warp_affine_8x8_c / warp_affine_8x8t_c from src/mc_tmpl.c. Filter taps vary
+// per column (tmx/tmy per 4x4 sub-block coordinate), so both passes use
+// transposed per-column tap matrices (LoadTapsT) instead of broadcasts.
+// Intermediate ranges over dav1d_mc_warp_filter (max positive tap sum 175,
+// negative -47): h-pass output in [-6015, 22395], v-pass dot in i32.
+template <typename Pixel, bool kTmp, typename Dst>
+static void hwy_warp8x8_impl(Dst *const dst, const ptrdiff_t dst_stride,
+                             const Pixel *const src, const ptrdiff_t src_stride,
+                             const int16_t *const abcd, int mx, int my,
+                             const int bitdepth_max) {
+    const int ib = sizeof(Pixel) == 1 ? 4 : 13 - hwy_ulog2(bitdepth_max);
+    const ptrdiff_t ss = src_stride / (ptrdiff_t) sizeof(Pixel);
+    const ptrdiff_t ds = kTmp ? dst_stride : dst_stride / (ptrdiff_t) sizeof(Pixel);
+    const hn::CappedTag<int16_t, 8> d;
+
+    int16_t mid[15 * 8];
+    const Pixel *srow = src - 3 * ss;
+    const int rnd_h = (1 << (7 - ib)) >> 1;
+    const hn::Repartition<int32_t, decltype(d)> d32;
+    for (int y = 0; y < 15; y++, mx += abcd[1], srow += ss) {
+        const int8_t *frows[8];
+        for (int x = 0, tmx = mx; x < 8; x++, tmx += abcd[0])
+            frows[x] = dav1d_mc_warp_filter[64 + ((tmx + 512) >> 10)];
+        hn::VFromD<decltype(d)> ft[8];
+        LoadTapsT(d, frows, ft);
+        // Contiguous window: lanes of v[k] are the per-column tap-k sources
+        // (same two loads the C code reads, srow[-3 .. 11]).
+        const auto v0 = LoadI16<8>(d, srow - 3, 8);
+        const auto v8 = LoadI16<0>(d, srow + 5, 7);
+        auto de0 = hn::Zero(d32), de1 = hn::Zero(d32);
+        auto do0 = hn::Zero(d32), do1 = hn::Zero(d32);
+        ForEachTap<0, 8>([&](auto kc) {
+            constexpr int k = decltype(kc)::value;
+            const auto v = ShiftedWindow<k>(d, v8, v0);
+            auto& de = (k & 1) ? de1 : de0;
+            auto& dout = (k & 1) ? do1 : do0;
+            de = hn::Add(de, hn::MulEven(v, ft[k]));
+            dout = hn::Add(dout, hn::MulOdd(v, ft[k]));
+        });
+        StoreI16<8>(d, mid + y * 8, 8,
+                    RoundPack(d, hn::Add(de0, de1), hn::Add(do0, do1),
+                              rnd_h, 7 - ib));
+    }
+
+    const int16_t *mrow = mid;
+    Dst *drow = dst;
+    for (int y = 0; y < 8; y++, my += abcd[3], mrow += 8, drow += ds) {
+        const int8_t *frows[8];
+        for (int x = 0, tmy = my; x < 8; x++, tmy += abcd[2])
+            frows[x] = dav1d_mc_warp_filter[64 + ((tmy + 512) >> 10)];
+        hn::VFromD<decltype(d)> ft[8];
+        LoadTapsT(d, frows, ft);
+        hn::VFromD<decltype(d)> rows[8];
+        for (int k = 0; k < 8; k++)
+            rows[k] = LoadI16<8>(d, mrow + k * 8, 8);
+        auto de0 = hn::Zero(d32), de1 = hn::Zero(d32);
+        auto do0 = hn::Zero(d32), do1 = hn::Zero(d32);
+        for (int k = 0; k < 8; k++) {
+            auto& de = (k & 1) ? de1 : de0;
+            auto& dout = (k & 1) ? do1 : do0;
+            de = hn::Add(de, hn::MulEven(rows[k], ft[k]));
+            dout = hn::Add(dout, hn::MulOdd(rows[k], ft[k]));
+        }
+        const auto dot_e = hn::Add(de0, de1);
+        const auto dot_o = hn::Add(do0, do1);
+        if constexpr (kTmp) {
+            // (dot + 64) >> 7 - PREP_BIAS, bias folded into the rounding
+            // constant (exact for arithmetic shifts; result fits int16).
+            constexpr int prep_bias = sizeof(Pixel) == 1 ? 0 : 8192;
+            StorePackI16<8>(d, reinterpret_cast<int16_t *>(drow), 8,
+                            dot_e, dot_o, 64 - (prep_bias << 7), 7);
+        } else {
+            StorePackPx<8>(d, reinterpret_cast<Pixel *>(drow), 8,
+                           dot_e, dot_o, (1 << (7 + ib)) >> 1, 7 + ib,
+                           bitdepth_max);
+        }
+    }
+}
+
 // Widths >= 8 are multiples of 8 in dav1d, so the partial-chunk path only
 // ever sees w < 8.
 template <typename Pixel>
@@ -1085,6 +1581,69 @@ static HWY_INLINE void hwy_prep_bilin(int16_t *const tmp, const Pixel *const src
     else
         hwy_prep_bilin_impl(tmp, src, src_stride, w, h, mx, my, bitdepth_max,
                             std::integral_constant<int, 0>{});
+}
+
+// The scaled kernels filter one 8-column chunk at a time; the kCap == 0
+// (partial) path only ever sees w < 8.
+template <typename Pixel>
+static HWY_INLINE void hwy_put_8tap_scaled(Pixel *const dst, const ptrdiff_t dst_stride,
+                                    const Pixel *const src, const ptrdiff_t src_stride,
+                                    const int w, const int h, const int mx, const int my,
+                                    const int dx, const int dy, const int filter_type,
+                                    const int bitdepth_max) {
+    if (w % 8 == 0)
+        hwy_put_8tap_scaled_impl(dst, dst_stride, src, src_stride, w, h, mx, my,
+                                 dx, dy, filter_type, bitdepth_max,
+                                 std::integral_constant<int, 8>{});
+    else
+        hwy_put_8tap_scaled_impl(dst, dst_stride, src, src_stride, w, h, mx, my,
+                                 dx, dy, filter_type, bitdepth_max,
+                                 std::integral_constant<int, 0>{});
+}
+
+template <typename Pixel>
+static HWY_INLINE void hwy_prep_8tap_scaled(int16_t *const tmp, const Pixel *const src,
+                                     const ptrdiff_t src_stride, const int w, const int h,
+                                     const int mx, const int my, const int dx,
+                                     const int dy, const int filter_type,
+                                     const int bitdepth_max) {
+    if (w % 8 == 0)
+        hwy_prep_8tap_scaled_impl(tmp, src, src_stride, w, h, mx, my, dx, dy,
+                                  filter_type, bitdepth_max,
+                                  std::integral_constant<int, 8>{});
+    else
+        hwy_prep_8tap_scaled_impl(tmp, src, src_stride, w, h, mx, my, dx, dy,
+                                  filter_type, bitdepth_max,
+                                  std::integral_constant<int, 0>{});
+}
+
+template <typename Pixel>
+static HWY_INLINE void hwy_put_bilin_scaled(Pixel *const dst, const ptrdiff_t dst_stride,
+                                     const Pixel *const src, const ptrdiff_t src_stride,
+                                     const int w, const int h, const int mx, const int my,
+                                     const int dx, const int dy,
+                                     const int bitdepth_max) {
+    if (w % 8 == 0)
+        hwy_put_bilin_scaled_impl(dst, dst_stride, src, src_stride, w, h, mx, my,
+                                  dx, dy, bitdepth_max,
+                                  std::integral_constant<int, 8>{});
+    else
+        hwy_put_bilin_scaled_impl(dst, dst_stride, src, src_stride, w, h, mx, my,
+                                  dx, dy, bitdepth_max,
+                                  std::integral_constant<int, 0>{});
+}
+
+template <typename Pixel>
+static HWY_INLINE void hwy_prep_bilin_scaled(int16_t *const tmp, const Pixel *const src,
+                                      const ptrdiff_t src_stride, const int w, const int h,
+                                      const int mx, const int my, const int dx,
+                                      const int dy, const int bitdepth_max) {
+    if (w % 8 == 0)
+        hwy_prep_bilin_scaled_impl(tmp, src, src_stride, w, h, mx, my, dx, dy,
+                                   bitdepth_max, std::integral_constant<int, 8>{});
+    else
+        hwy_prep_bilin_scaled_impl(tmp, src, src_stride, w, h, mx, my, dx, dy,
+                                   bitdepth_max, std::integral_constant<int, 0>{});
 }
 
 #define HWY_MC_FILTER_FNS(bpc, sfx, HIGHBD_SUFFIX, BD_MAX) \
@@ -1217,17 +1776,77 @@ void prep_bilin_##sfx(int16_t *tmp, const uint##bpc##_t *src, \
     hwy_prep_bilin(tmp, src, src_stride, w, h, mx, my, BD_MAX); \
 }
 
+/* HIGHBD_SUFFIX/BD_MAX are referenced as ambient macros, not passed along,
+ * so that their expansions are not pre-expanded into macro arguments. */
+#define HWY_MC_SCALED_PUT_FN(name, sfx, FT, bpc) \
+void put_8tap_##name##_scaled_##sfx(uint##bpc##_t *dst, const ptrdiff_t dst_stride, \
+                            const uint##bpc##_t *src, const ptrdiff_t src_stride, \
+                            const int w, const int h, const int mx, const int my, \
+                            const int dx, const int dy HIGHBD_SUFFIX) { \
+    hwy_put_8tap_scaled(dst, dst_stride, src, src_stride, w, h, mx, my, dx, dy, \
+                        FT, BD_MAX); \
+} \
+void prep_8tap_##name##_scaled_##sfx(int16_t *tmp, const uint##bpc##_t *src, \
+                             const ptrdiff_t src_stride, const int w, const int h, \
+                             const int mx, const int my, const int dx, \
+                             const int dy HIGHBD_SUFFIX) { \
+    hwy_prep_8tap_scaled(tmp, src, src_stride, w, h, mx, my, dx, dy, \
+                         FT, BD_MAX); \
+}
+
+#define HWY_MC_SCALED_FNS(bpc, sfx) \
+HWY_MC_SCALED_PUT_FN(regular,        sfx, kFilterRegular | (kFilterRegular << 2), bpc) \
+HWY_MC_SCALED_PUT_FN(regular_smooth, sfx, kFilterRegular | (kFilterSmooth << 2),  bpc) \
+HWY_MC_SCALED_PUT_FN(regular_sharp,  sfx, kFilterRegular | (kFilterSharp << 2),   bpc) \
+HWY_MC_SCALED_PUT_FN(sharp_regular,  sfx, kFilterSharp | (kFilterRegular << 2),   bpc) \
+HWY_MC_SCALED_PUT_FN(sharp_smooth,   sfx, kFilterSharp | (kFilterSmooth << 2),    bpc) \
+HWY_MC_SCALED_PUT_FN(sharp,          sfx, kFilterSharp | (kFilterSharp << 2),     bpc) \
+HWY_MC_SCALED_PUT_FN(smooth_regular, sfx, kFilterSmooth | (kFilterRegular << 2),  bpc) \
+HWY_MC_SCALED_PUT_FN(smooth,         sfx, kFilterSmooth | (kFilterSmooth << 2),   bpc) \
+HWY_MC_SCALED_PUT_FN(smooth_sharp,   sfx, kFilterSmooth | (kFilterSharp << 2),    bpc) \
+void put_bilin_scaled_##sfx(uint##bpc##_t *dst, const ptrdiff_t dst_stride, \
+                     const uint##bpc##_t *src, const ptrdiff_t src_stride, \
+                     const int w, const int h, const int mx, const int my, \
+                     const int dx, const int dy HIGHBD_SUFFIX) { \
+    hwy_put_bilin_scaled(dst, dst_stride, src, src_stride, w, h, mx, my, \
+                         dx, dy, BD_MAX); \
+} \
+void prep_bilin_scaled_##sfx(int16_t *tmp, const uint##bpc##_t *src, \
+                      const ptrdiff_t src_stride, const int w, const int h, \
+                      const int mx, const int my, const int dx, const int dy \
+                      HIGHBD_SUFFIX) { \
+    hwy_prep_bilin_scaled(tmp, src, src_stride, w, h, mx, my, dx, dy, BD_MAX); \
+} \
+void warp_affine_8x8_##sfx(uint##bpc##_t *dst, const ptrdiff_t dst_stride, \
+                    const uint##bpc##_t *src, const ptrdiff_t src_stride, \
+                    const int16_t *const abcd, const int mx, const int my \
+                    HIGHBD_SUFFIX) { \
+    hwy_warp8x8_impl<uint##bpc##_t, false>(dst, dst_stride, src, src_stride, \
+                                           abcd, mx, my, BD_MAX); \
+} \
+void warp_affine_8x8t_##sfx(int16_t *tmp, const ptrdiff_t tmp_stride, \
+                     const uint##bpc##_t *src, const ptrdiff_t src_stride, \
+                     const int16_t *const abcd, const int mx, const int my \
+                     HIGHBD_SUFFIX) { \
+    hwy_warp8x8_impl<uint##bpc##_t, true>(tmp, tmp_stride, src, src_stride, \
+                                          abcd, mx, my, BD_MAX); \
+}
+
 #define HIGHBD_SUFFIX
 #define BD_MAX 255
 HWY_MC_FILTER_FNS(8, 8bpc, HIGHBD_SUFFIX, BD_MAX)
+HWY_MC_SCALED_FNS(8, 8bpc)
 #undef HIGHBD_SUFFIX
 #undef BD_MAX
 #define HIGHBD_SUFFIX , const int bitdepth_max
 #define BD_MAX bitdepth_max
 HWY_MC_FILTER_FNS(16, 16bpc, HIGHBD_SUFFIX, BD_MAX)
+HWY_MC_SCALED_FNS(16, 16bpc)
 #undef HIGHBD_SUFFIX
 #undef BD_MAX
 #undef HWY_MC_FILTER_FNS
+#undef HWY_MC_SCALED_FNS
+#undef HWY_MC_SCALED_PUT_FN
 
 }  // namespace HWY_NAMESPACE
 }  // namespace dav1d
@@ -1257,6 +1876,28 @@ HWY_EXPORT(prep_8tap_smooth_regular_8bpc);
 HWY_EXPORT(prep_8tap_smooth_8bpc);
 HWY_EXPORT(prep_8tap_smooth_sharp_8bpc);
 HWY_EXPORT(prep_bilin_8bpc);
+HWY_EXPORT(put_8tap_regular_scaled_8bpc);
+HWY_EXPORT(put_8tap_regular_smooth_scaled_8bpc);
+HWY_EXPORT(put_8tap_regular_sharp_scaled_8bpc);
+HWY_EXPORT(put_8tap_sharp_regular_scaled_8bpc);
+HWY_EXPORT(put_8tap_sharp_smooth_scaled_8bpc);
+HWY_EXPORT(put_8tap_sharp_scaled_8bpc);
+HWY_EXPORT(put_8tap_smooth_regular_scaled_8bpc);
+HWY_EXPORT(put_8tap_smooth_scaled_8bpc);
+HWY_EXPORT(put_8tap_smooth_sharp_scaled_8bpc);
+HWY_EXPORT(put_bilin_scaled_8bpc);
+HWY_EXPORT(prep_8tap_regular_scaled_8bpc);
+HWY_EXPORT(prep_8tap_regular_smooth_scaled_8bpc);
+HWY_EXPORT(prep_8tap_regular_sharp_scaled_8bpc);
+HWY_EXPORT(prep_8tap_sharp_regular_scaled_8bpc);
+HWY_EXPORT(prep_8tap_sharp_smooth_scaled_8bpc);
+HWY_EXPORT(prep_8tap_sharp_scaled_8bpc);
+HWY_EXPORT(prep_8tap_smooth_regular_scaled_8bpc);
+HWY_EXPORT(prep_8tap_smooth_scaled_8bpc);
+HWY_EXPORT(prep_8tap_smooth_sharp_scaled_8bpc);
+HWY_EXPORT(prep_bilin_scaled_8bpc);
+HWY_EXPORT(warp_affine_8x8_8bpc);
+HWY_EXPORT(warp_affine_8x8t_8bpc);
 HWY_EXPORT(put_8tap_regular_16bpc);
 HWY_EXPORT(put_8tap_regular_smooth_16bpc);
 HWY_EXPORT(put_8tap_regular_sharp_16bpc);
@@ -1277,21 +1918,71 @@ HWY_EXPORT(prep_8tap_smooth_regular_16bpc);
 HWY_EXPORT(prep_8tap_smooth_16bpc);
 HWY_EXPORT(prep_8tap_smooth_sharp_16bpc);
 HWY_EXPORT(prep_bilin_16bpc);
+HWY_EXPORT(put_8tap_regular_scaled_16bpc);
+HWY_EXPORT(put_8tap_regular_smooth_scaled_16bpc);
+HWY_EXPORT(put_8tap_regular_sharp_scaled_16bpc);
+HWY_EXPORT(put_8tap_sharp_regular_scaled_16bpc);
+HWY_EXPORT(put_8tap_sharp_smooth_scaled_16bpc);
+HWY_EXPORT(put_8tap_sharp_scaled_16bpc);
+HWY_EXPORT(put_8tap_smooth_regular_scaled_16bpc);
+HWY_EXPORT(put_8tap_smooth_scaled_16bpc);
+HWY_EXPORT(put_8tap_smooth_sharp_scaled_16bpc);
+HWY_EXPORT(put_bilin_scaled_16bpc);
+HWY_EXPORT(prep_8tap_regular_scaled_16bpc);
+HWY_EXPORT(prep_8tap_regular_smooth_scaled_16bpc);
+HWY_EXPORT(prep_8tap_regular_sharp_scaled_16bpc);
+HWY_EXPORT(prep_8tap_sharp_regular_scaled_16bpc);
+HWY_EXPORT(prep_8tap_sharp_smooth_scaled_16bpc);
+HWY_EXPORT(prep_8tap_sharp_scaled_16bpc);
+HWY_EXPORT(prep_8tap_smooth_regular_scaled_16bpc);
+HWY_EXPORT(prep_8tap_smooth_scaled_16bpc);
+HWY_EXPORT(prep_8tap_smooth_sharp_scaled_16bpc);
+HWY_EXPORT(prep_bilin_scaled_16bpc);
+HWY_EXPORT(warp_affine_8x8_16bpc);
+HWY_EXPORT(warp_affine_8x8t_16bpc);
 }  // namespace dav1d
 
 namespace {
 // Prefix of Dav1dMCDSPContext (src/mc.h), so that this file does not need
-// dav1d's bitdepth-templated C headers; only mc[]/mct[] are installed here.
+// dav1d's bitdepth-templated C headers; the compound/avg/mask/blend slots in
+// between are only skipped over, never read or written here.
 using McFn8 = void (*)(uint8_t *, ptrdiff_t, const uint8_t *, ptrdiff_t,
                        int, int, int, int);
 using McScaledFn8 = void (*)(uint8_t *, ptrdiff_t, const uint8_t *, ptrdiff_t,
                              int, int, int, int, int, int);
 using MctFn8 = void (*)(int16_t *, const uint8_t *, ptrdiff_t,
                         int, int, int, int);
+using MctScaledFn8 = void (*)(int16_t *, const uint8_t *, ptrdiff_t,
+                              int, int, int, int, int, int);
+using AvgFn8 = void (*)(uint8_t *, ptrdiff_t, const int16_t *, const int16_t *,
+                        int, int);
+using WAvgFn8 = void (*)(uint8_t *, ptrdiff_t, const int16_t *,
+                         const int16_t *, int, int, int);
+using MaskFn8 = void (*)(uint8_t *, ptrdiff_t, const int16_t *,
+                         const int16_t *, int, int, const uint8_t *);
+using WMaskFn8 = void (*)(uint8_t *, ptrdiff_t, const int16_t *,
+                          const int16_t *, int, int, uint8_t *, int);
+using BlendFn8 = void (*)(uint8_t *, ptrdiff_t, const uint8_t *, int, int,
+                          const uint8_t *);
+using BlendDirFn8 = void (*)(uint8_t *, ptrdiff_t, const uint8_t *, int, int);
+using WarpFn8 = void (*)(uint8_t *, ptrdiff_t, const uint8_t *, ptrdiff_t,
+                         const int16_t *, int, int);
+using WarpTFn8 = void (*)(int16_t *, ptrdiff_t, const uint8_t *, ptrdiff_t,
+                          const int16_t *, int, int);
 struct McDSP8 {
     McFn8 mc[10];
     McScaledFn8 mc_scaled[10];
     MctFn8 mct[10];
+    MctScaledFn8 mct_scaled[10];
+    AvgFn8 avg;
+    WAvgFn8 w_avg;
+    MaskFn8 mask;
+    WMaskFn8 w_mask[3];
+    BlendFn8 blend;
+    BlendDirFn8 blend_v;
+    BlendDirFn8 blend_h;
+    WarpFn8 warp8x8;
+    WarpTFn8 warp8x8t;
 };
 
 using McFn16 = void (*)(uint16_t *, ptrdiff_t, const uint16_t *, ptrdiff_t,
@@ -1300,10 +1991,37 @@ using McScaledFn16 = void (*)(uint16_t *, ptrdiff_t, const uint16_t *, ptrdiff_t
                               int, int, int, int, int, int, int);
 using MctFn16 = void (*)(int16_t *, const uint16_t *, ptrdiff_t,
                          int, int, int, int, int);
+using MctScaledFn16 = void (*)(int16_t *, const uint16_t *, ptrdiff_t,
+                               int, int, int, int, int, int, int);
+using AvgFn16 = void (*)(uint16_t *, ptrdiff_t, const int16_t *,
+                         const int16_t *, int, int, int);
+using WAvgFn16 = void (*)(uint16_t *, ptrdiff_t, const int16_t *,
+                          const int16_t *, int, int, int, int);
+using MaskFn16 = void (*)(uint16_t *, ptrdiff_t, const int16_t *,
+                          const int16_t *, int, int, const uint8_t *, int);
+using WMaskFn16 = void (*)(uint16_t *, ptrdiff_t, const int16_t *,
+                           const int16_t *, int, int, uint8_t *, int, int);
+using BlendFn16 = void (*)(uint16_t *, ptrdiff_t, const uint16_t *, int, int,
+                           const uint8_t *);
+using BlendDirFn16 = void (*)(uint16_t *, ptrdiff_t, const uint16_t *, int, int);
+using WarpFn16 = void (*)(uint16_t *, ptrdiff_t, const uint16_t *, ptrdiff_t,
+                          const int16_t *, int, int, int);
+using WarpTFn16 = void (*)(int16_t *, ptrdiff_t, const uint16_t *, ptrdiff_t,
+                           const int16_t *, int, int, int);
 struct McDSP16 {
     McFn16 mc[10];
     McScaledFn16 mc_scaled[10];
     MctFn16 mct[10];
+    MctScaledFn16 mct_scaled[10];
+    AvgFn16 avg;
+    WAvgFn16 w_avg;
+    MaskFn16 mask;
+    WMaskFn16 w_mask[3];
+    BlendFn16 blend;
+    BlendDirFn16 blend_v;
+    BlendDirFn16 blend_h;
+    WarpFn16 warp8x8;
+    WarpTFn16 warp8x8t;
 };
 }  // namespace
 
@@ -1339,6 +2057,28 @@ static void mc_dsp_init_8bpc_hwy(void *const c) {
     ctx->mct[7] = HWY_DYNAMIC_POINTER(prep_8tap_smooth_8bpc);
     ctx->mct[8] = HWY_DYNAMIC_POINTER(prep_8tap_smooth_sharp_8bpc);
     ctx->mct[9] = HWY_DYNAMIC_POINTER(prep_bilin_8bpc);
+    ctx->mc_scaled[0] = HWY_DYNAMIC_POINTER(put_8tap_regular_scaled_8bpc);
+    ctx->mc_scaled[1] = HWY_DYNAMIC_POINTER(put_8tap_regular_smooth_scaled_8bpc);
+    ctx->mc_scaled[2] = HWY_DYNAMIC_POINTER(put_8tap_regular_sharp_scaled_8bpc);
+    ctx->mc_scaled[3] = HWY_DYNAMIC_POINTER(put_8tap_sharp_regular_scaled_8bpc);
+    ctx->mc_scaled[4] = HWY_DYNAMIC_POINTER(put_8tap_sharp_smooth_scaled_8bpc);
+    ctx->mc_scaled[5] = HWY_DYNAMIC_POINTER(put_8tap_sharp_scaled_8bpc);
+    ctx->mc_scaled[6] = HWY_DYNAMIC_POINTER(put_8tap_smooth_regular_scaled_8bpc);
+    ctx->mc_scaled[7] = HWY_DYNAMIC_POINTER(put_8tap_smooth_scaled_8bpc);
+    ctx->mc_scaled[8] = HWY_DYNAMIC_POINTER(put_8tap_smooth_sharp_scaled_8bpc);
+    ctx->mc_scaled[9] = HWY_DYNAMIC_POINTER(put_bilin_scaled_8bpc);
+    ctx->mct_scaled[0] = HWY_DYNAMIC_POINTER(prep_8tap_regular_scaled_8bpc);
+    ctx->mct_scaled[1] = HWY_DYNAMIC_POINTER(prep_8tap_regular_smooth_scaled_8bpc);
+    ctx->mct_scaled[2] = HWY_DYNAMIC_POINTER(prep_8tap_regular_sharp_scaled_8bpc);
+    ctx->mct_scaled[3] = HWY_DYNAMIC_POINTER(prep_8tap_sharp_regular_scaled_8bpc);
+    ctx->mct_scaled[4] = HWY_DYNAMIC_POINTER(prep_8tap_sharp_smooth_scaled_8bpc);
+    ctx->mct_scaled[5] = HWY_DYNAMIC_POINTER(prep_8tap_sharp_scaled_8bpc);
+    ctx->mct_scaled[6] = HWY_DYNAMIC_POINTER(prep_8tap_smooth_regular_scaled_8bpc);
+    ctx->mct_scaled[7] = HWY_DYNAMIC_POINTER(prep_8tap_smooth_scaled_8bpc);
+    ctx->mct_scaled[8] = HWY_DYNAMIC_POINTER(prep_8tap_smooth_sharp_scaled_8bpc);
+    ctx->mct_scaled[9] = HWY_DYNAMIC_POINTER(prep_bilin_scaled_8bpc);
+    ctx->warp8x8 = HWY_DYNAMIC_POINTER(warp_affine_8x8_8bpc);
+    ctx->warp8x8t = HWY_DYNAMIC_POINTER(warp_affine_8x8t_8bpc);
 }
 
 static void mc_dsp_init_16bpc_hwy(void *const c) {
@@ -1363,6 +2103,28 @@ static void mc_dsp_init_16bpc_hwy(void *const c) {
     ctx->mct[7] = HWY_DYNAMIC_POINTER(prep_8tap_smooth_16bpc);
     ctx->mct[8] = HWY_DYNAMIC_POINTER(prep_8tap_smooth_sharp_16bpc);
     ctx->mct[9] = HWY_DYNAMIC_POINTER(prep_bilin_16bpc);
+    ctx->mc_scaled[0] = HWY_DYNAMIC_POINTER(put_8tap_regular_scaled_16bpc);
+    ctx->mc_scaled[1] = HWY_DYNAMIC_POINTER(put_8tap_regular_smooth_scaled_16bpc);
+    ctx->mc_scaled[2] = HWY_DYNAMIC_POINTER(put_8tap_regular_sharp_scaled_16bpc);
+    ctx->mc_scaled[3] = HWY_DYNAMIC_POINTER(put_8tap_sharp_regular_scaled_16bpc);
+    ctx->mc_scaled[4] = HWY_DYNAMIC_POINTER(put_8tap_sharp_smooth_scaled_16bpc);
+    ctx->mc_scaled[5] = HWY_DYNAMIC_POINTER(put_8tap_sharp_scaled_16bpc);
+    ctx->mc_scaled[6] = HWY_DYNAMIC_POINTER(put_8tap_smooth_regular_scaled_16bpc);
+    ctx->mc_scaled[7] = HWY_DYNAMIC_POINTER(put_8tap_smooth_scaled_16bpc);
+    ctx->mc_scaled[8] = HWY_DYNAMIC_POINTER(put_8tap_smooth_sharp_scaled_16bpc);
+    ctx->mc_scaled[9] = HWY_DYNAMIC_POINTER(put_bilin_scaled_16bpc);
+    ctx->mct_scaled[0] = HWY_DYNAMIC_POINTER(prep_8tap_regular_scaled_16bpc);
+    ctx->mct_scaled[1] = HWY_DYNAMIC_POINTER(prep_8tap_regular_smooth_scaled_16bpc);
+    ctx->mct_scaled[2] = HWY_DYNAMIC_POINTER(prep_8tap_regular_sharp_scaled_16bpc);
+    ctx->mct_scaled[3] = HWY_DYNAMIC_POINTER(prep_8tap_sharp_regular_scaled_16bpc);
+    ctx->mct_scaled[4] = HWY_DYNAMIC_POINTER(prep_8tap_sharp_smooth_scaled_16bpc);
+    ctx->mct_scaled[5] = HWY_DYNAMIC_POINTER(prep_8tap_sharp_scaled_16bpc);
+    ctx->mct_scaled[6] = HWY_DYNAMIC_POINTER(prep_8tap_smooth_regular_scaled_16bpc);
+    ctx->mct_scaled[7] = HWY_DYNAMIC_POINTER(prep_8tap_smooth_scaled_16bpc);
+    ctx->mct_scaled[8] = HWY_DYNAMIC_POINTER(prep_8tap_smooth_sharp_scaled_16bpc);
+    ctx->mct_scaled[9] = HWY_DYNAMIC_POINTER(prep_bilin_scaled_16bpc);
+    ctx->warp8x8 = HWY_DYNAMIC_POINTER(warp_affine_8x8_16bpc);
+    ctx->warp8x8t = HWY_DYNAMIC_POINTER(warp_affine_8x8t_16bpc);
 }
 
 }  // namespace dav1d
