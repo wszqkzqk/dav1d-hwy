@@ -363,6 +363,23 @@ foreach bitdepth : dav1d_bitdepths
     endforeach
 endforeach
 
+# Google Highway based DSP functions (single C++ TU per module covering all
+# bitdepths, compiled for multiple SIMD targets with runtime dispatch)
+libdav1d_hwy_objs = []
+libhwy_deps = []
+if have_highway
+    libdav1d_hwy_objs = static_library(
+        'dav1d_hwy',
+        files('hwy/cdef.cpp'),
+        include_directories: dav1d_inc_dirs,
+        dependencies : [libhwy_dependency],
+        override_options : ['cpp_std=c++17'],
+        install : false,
+        build_by_default : false,
+    ).extract_all_objects(recursive: true)
+    libhwy_deps = [libhwy_dependency]
+endif
+
 # The final dav1d library
 if host_machine.system() == 'windows'
     dav1d_soversion = ''
@@ -379,6 +396,7 @@ libdav1d = library('dav1d',
 
     objects : [
         libdav1d_bitdepth_objs,
+        libdav1d_hwy_objs,
         ],
 
     include_directories : dav1d_inc_dirs,
@@ -387,6 +405,7 @@ libdav1d = library('dav1d',
         thread_dependency,
         thread_compat_dep,
         libdl_dependency,
+        libhwy_deps,
         ],
     c_args : [libdav1d_flags, api_export_flags],
     version : dav1d_soname_version,
@@ -395,7 +414,8 @@ libdav1d = library('dav1d',
 )
 
 dav1d_dep = declare_dependency(link_with: libdav1d,
-    include_directories : include_directories('../include')
+    include_directories : include_directories('../include'),
+    dependencies : libhwy_deps,
 )
 
 #

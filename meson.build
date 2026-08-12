@@ -596,6 +596,17 @@ if is_asm_enabled and host_machine.cpu_family().startswith('riscv')
     endif
 endif
 
+# Google Highway (portable SIMD with runtime dispatch) support.
+# Provides unified SIMD DSP implementations for architectures where the
+# handwritten asm coverage is incomplete (e.g. loongarch, riscv, ppc).
+libhwy_dependency = dependency('libhwy', required: get_option('enable_highway'))
+have_highway = libhwy_dependency.found()
+if have_highway
+    # Highway is C++, so we need a C++ compiler as well
+    have_highway = add_languages('cpp', required: get_option('enable_highway'))
+endif
+cdata.set10('HAVE_HIGHWAY', have_highway)
+
 # Generate config.h
 config_h_target = configure_file(output: 'config.h', configuration: cdata)
 

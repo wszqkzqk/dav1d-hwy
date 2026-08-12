@@ -87,6 +87,7 @@ if is_asm_enabled and checkasm_dependency.found()
             thread_dependency,
             libm_dependency,
             checkasm_dependency,
+            libhwy_deps,
             ],
         c_args: checkasm_args,
         )

@@ -10,6 +10,11 @@ option('enable_asm',
     value: true,
     description: 'Build asm files, if available')
 
+option('enable_highway',
+    type: 'feature',
+    value: 'auto',
+    description: 'Build Google Highway based SIMD DSP functions with runtime dispatch, if libhwy is available')
+
 option('enable_tools',
     type: 'boolean',
     value: true,
