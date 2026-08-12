@@ -32,6 +32,7 @@
 
 #include "src/cdef.h"
 #include "src/loopfilter.h"
+#include "src/mc.h"
 
 /* Google Highway based DSP functions (src/hwy/), dispatched at runtime to
  * the best SIMD target. Install before the architecture-specific asm init,
@@ -39,5 +40,6 @@
 
 bitfn_decls(void dav1d_cdef_dsp_init_hwy, Dav1dCdefDSPContext *c);
 bitfn_decls(void dav1d_loop_filter_dsp_init_hwy, Dav1dLoopFilterDSPContext *c);
+bitfn_decls(void dav1d_mc_dsp_init_hwy, Dav1dMCDSPContext *c);
 
 #endif /* DAV1D_SRC_HWY_DSP_H */

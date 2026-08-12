@@ -33,8 +33,13 @@
 #include "common/attributes.h"
 #include "common/intops.h"
 
+#include "src/cpu.h"
 #include "src/mc.h"
 #include "src/tables.h"
+
+#if HAVE_HIGHWAY
+#include "src/hwy_dsp.h"
+#endif
 
 #if BITDEPTH == 8
 #define get_intermediate_bits(bitdepth_max) 4
@@ -989,6 +994,17 @@ COLD void bitfn(dav1d_mc_dsp_init)(Dav1dMCDSPContext *const c) {
     c->warp8x8t = warp_affine_8x8t_c;
     c->emu_edge = emu_edge_c;
     c->resize   = resize_c;
+
+#if HAVE_HIGHWAY
+    /* Portable SIMD put/prep kernels, dispatched at runtime to the best SIMD
+     * target; the asm init below still takes precedence where it exists.
+     * Skipped when all cpu flags are masked off (checkasm's C reference
+     * pass). */
+#if HAVE_ASM
+    if (dav1d_get_cpu_flags())
+#endif
+        bitfn(dav1d_mc_dsp_init_hwy)(c);
+#endif
 
 #if HAVE_ASM
 #if ARCH_AARCH64 || ARCH_ARM
