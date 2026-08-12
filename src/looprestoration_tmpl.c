@@ -36,7 +36,12 @@
 #include "common/intops.h"
 
 #include "src/looprestoration.h"
+#include "src/cpu.h"
 #include "src/tables.h"
+
+#if HAVE_HIGHWAY
+#include "src/hwy_dsp.h"
+#endif
 
 // 256 * 1.5 + 3 + 3 = 390
 #define REST_UNIT_STRIDE (390)
@@ -1369,6 +1374,16 @@ COLD void bitfn(dav1d_loop_restoration_dsp_init)(Dav1dLoopRestorationDSPContext 
     c->sgr[0] = sgr_5x5_c;
     c->sgr[1] = sgr_3x3_c;
     c->sgr[2] = sgr_mix_c;
+
+#if HAVE_HIGHWAY
+    /* Portable SIMD versions, dispatched at runtime to the best SIMD target;
+     * the asm init below still takes precedence where it exists. Skipped when
+     * all cpu flags are masked off (checkasm's C reference pass). */
+#if HAVE_ASM
+    if (dav1d_get_cpu_flags())
+#endif
+        bitfn(dav1d_loop_restoration_dsp_init_hwy)(c);
+#endif
 
 #if HAVE_ASM
 #if ARCH_AARCH64 || ARCH_ARM

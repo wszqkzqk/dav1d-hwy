@@ -373,6 +373,7 @@ if have_highway
         files('hwy/cdef.cpp',
               'hwy/ipred.cpp',
               'hwy/loopfilter.cpp',
+              'hwy/looprestoration.cpp',
               'hwy/mc.cpp',
               'hwy/mc_compound.cpp'),
         include_directories: dav1d_inc_dirs,
