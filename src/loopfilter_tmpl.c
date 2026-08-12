@@ -34,6 +34,11 @@
 
 #include "src/loopfilter.h"
 
+#if HAVE_HIGHWAY
+#include "src/cpu.h"
+#include "src/hwy_dsp.h"
+#endif
+
 static NOINLINE void
 loop_filter(pixel *dst, int E, int I, int H,
             const ptrdiff_t stridea, const ptrdiff_t strideb, const int wd
@@ -261,6 +266,16 @@ COLD void bitfn(dav1d_loop_filter_dsp_init)(Dav1dLoopFilterDSPContext *const c) 
     c->loop_filter_sb[0][1] = loop_filter_v_sb128y_c;
     c->loop_filter_sb[1][0] = loop_filter_h_sb128uv_c;
     c->loop_filter_sb[1][1] = loop_filter_v_sb128uv_c;
+
+#if HAVE_HIGHWAY
+    /* Portable SIMD versions, dispatched at runtime to the best SIMD target;
+     * the asm init below still takes precedence where it exists. Skipped when
+     * all cpu flags are masked off (checkasm's C reference pass). */
+#if HAVE_ASM
+    if (dav1d_get_cpu_flags())
+#endif
+        bitfn(dav1d_loop_filter_dsp_init_hwy)(c);
+#endif
 
 #if HAVE_ASM
 #if ARCH_AARCH64 || ARCH_ARM

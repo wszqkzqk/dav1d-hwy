@@ -370,7 +370,8 @@ libhwy_deps = []
 if have_highway
     libdav1d_hwy_objs = static_library(
         'dav1d_hwy',
-        files('hwy/cdef.cpp'),
+        files('hwy/cdef.cpp',
+              'hwy/loopfilter.cpp'),
         include_directories: dav1d_inc_dirs,
         dependencies : [libhwy_dependency],
         override_options : ['cpp_std=c++17'],
