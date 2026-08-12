@@ -33,6 +33,7 @@
 #include "src/cdef.h"
 #include "src/filmgrain.h"
 #include "src/ipred.h"
+#include "src/itx.h"
 #include "src/loopfilter.h"
 #include "src/looprestoration.h"
 #include "src/mc.h"
@@ -46,6 +47,7 @@
 bitfn_decls(void dav1d_cdef_dsp_init_hwy, Dav1dCdefDSPContext *c);
 bitfn_decls(void dav1d_film_grain_dsp_init_hwy, Dav1dFilmGrainDSPContext *c);
 bitfn_decls(void dav1d_ipred_dsp_init_hwy, Dav1dIntraPredDSPContext *c);
+bitfn_decls(void dav1d_itx_dsp_init_hwy, Dav1dInvTxfmDSPContext *c, int bpc);
 bitfn_decls(void dav1d_loop_filter_dsp_init_hwy, Dav1dLoopFilterDSPContext *c);
 bitfn_decls(void dav1d_loop_restoration_dsp_init_hwy, Dav1dLoopRestorationDSPContext *c);
 bitfn_decls(void dav1d_mc_dsp_init_hwy, Dav1dMCDSPContext *c);

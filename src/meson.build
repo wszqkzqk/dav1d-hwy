@@ -373,6 +373,7 @@ if have_highway
         files('hwy/cdef.cpp',
               'hwy/filmgrain.cpp',
               'hwy/ipred.cpp',
+              'hwy/itx.cpp',
               'hwy/loopfilter.cpp',
               'hwy/looprestoration.cpp',
               'hwy/mc.cpp',

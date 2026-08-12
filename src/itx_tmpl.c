@@ -35,10 +35,15 @@
 #include "common/attributes.h"
 #include "common/intops.h"
 
+#include "src/cpu.h"
 #include "src/itx.h"
 #include "src/itx_1d.h"
 #include "src/scan.h"
 #include "src/tables.h"
+
+#if HAVE_HIGHWAY
+#include "src/hwy_dsp.h"
+#endif
 
 static NOINLINE void
 inv_txfm_add_c(pixel *dst, const ptrdiff_t stride, coef *const coeff,
@@ -286,6 +291,16 @@ COLD void bitfn(dav1d_itx_dsp_init)(Dav1dInvTxfmDSPContext *const c, int bpc) {
     assign_itx_all_fn64(64, 16, R);
     assign_itx_all_fn64(64, 32, R);
     assign_itx_all_fn64(64, 64, );
+
+#if HAVE_HIGHWAY
+    /* Portable SIMD versions, dispatched at runtime to the best SIMD target;
+     * the asm init below still takes precedence where it exists. Skipped when
+     * all cpu flags are masked off (checkasm's C reference pass). */
+#if HAVE_ASM
+    if (dav1d_get_cpu_flags())
+#endif
+        bitfn(dav1d_itx_dsp_init_hwy)(c, bpc);
+#endif
 
     int all_simd = 0;
 #if HAVE_ASM
