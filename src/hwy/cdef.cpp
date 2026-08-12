@@ -381,6 +381,139 @@ CDEF_FILTER_FN(4, 4, 16, 16bpc)
 #undef BD_MINUS_8
 #undef CDEF_FILTER_FN
 
+// Port of cdef_find_dir_c (src/cdef_tmpl.c). Each direction's line sums
+// (bins) reduce to a diagonal accumulation bins[i + k] += row_i[k] over
+// (possibly folded/reversed) rows of the 8x8 block of
+// x = (pixel >> bitdepth_min_8) - 128, x in [-128, 127]:
+//   dir 0: rows as-is;            dir 4: rows reversed (Reverse8);
+//   dir 1: column-pair fold;      dir 3: column-pair fold reversed (Reverse4);
+//   dir 7: row-pair fold;         dir 5: row-pair fold, reversed row order;
+//   dir 2: per-row sums;          dir 6: column sums.
+
+// bins[k] += row_i[k - i], with row_i produced by row(i); bins must be
+// zeroed by the caller (16 entries, only R + W - 1 used). RowFn rather than
+// a vector array: RVV vector types are sizeless.
+template <class D, class RowFn>
+static inline void cdef_diag_bins(const D d, RowFn&& row, const int R,
+                                  const int W, int16_t *const bins)
+{
+    for (int i = 0; i < R; i++)
+        hn::StoreN(hn::Add(hn::LoadN(d, bins + i, W), row(i)), d, bins + i, W);
+}
+
+// Cost weights of div_table in cdef_find_dir_c: symmetric pairs for the
+// diagonal directions (0 and 4, 15 bins), and the 5 full lines + 3 pairs of
+// the odd directions (11 bins).
+alignas(16) static const int32_t kCdefWDiag[16] = { 840, 420, 280, 210, 168,
+    140, 120, 105, 120, 140, 168, 210, 280, 420, 840, 0 };
+alignas(16) static const int32_t kCdefWOdd[16] = { 420, 210, 140, 105, 105,
+    105, 105, 105, 140, 210, 420, 0, 0, 0, 0, 0 };
+alignas(16) static const int32_t kCdefW105[16] = { 105, 105, 105, 105, 105,
+    105, 105, 105, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+// Weighted sum of squared bins; w covers 16 bins (zero-padded). |bin| <=
+// 8 * 128, so the i32 arithmetic is exact and the lane order cannot change
+// the result.
+template <class D32>
+static inline unsigned cdef_bin_cost(const D32 d32, const int16_t *const bins,
+                                     const int32_t *const w)
+{
+    const hn::Rebind<int16_t, D32> d16;
+    const size_t K = hn::Lanes(d32);
+    auto acc = hn::Zero(d32);
+    for (size_t k = 0; k < 16; k += K) {
+        const auto b = hn::PromoteTo(d32, hn::LoadN(d16, bins + k, K));
+        acc = hn::Add(acc, hn::Mul(hn::Mul(b, b), hn::LoadN(d32, w + k, K)));
+    }
+    return (unsigned) hn::ReduceSum(d32, acc);
+}
+
+template <typename Pixel>
+static int cdef_find_dir(const Pixel *const img, const ptrdiff_t stride,
+                         unsigned *const var, const int bitdepth_min_8)
+{
+    const hn::ScalableTag<int16_t> d;
+    const hn::Rebind<Pixel, decltype(d)> dp;
+    const ptrdiff_t pxstride = stride / (ptrdiff_t) sizeof(Pixel);
+
+    // LoadN zero-fills lanes [8, Lanes), which stays inert: every step is
+    // per-lane or works on independent 8-lane blocks. The shift is exact in
+    // int16 because pixel values are <= 4095 (non-negative).
+    alignas(16) int16_t xb[64];
+    for (int y = 0; y < 8; y++)
+        hn::StoreN(hn::Sub(hn::ShiftRightSame(
+                               hwy_widen(d, hn::LoadN(dp, img + y * pxstride, 8)),
+                               bitdepth_min_8),
+                           hn::Set(d, 128)),
+                   d, xb + y * 8, 8);
+
+    int16_t b0[16] = {}, b1[16] = {}, b3[16] = {}, b4[16] = {}, b5[16] = {},
+            b7[16] = {};
+    int16_t rs[16] = {}, cc[16] = {};
+
+    const auto row = [&](const int i) { return hn::LoadN(d, xb + i * 8, 8); };
+    cdef_diag_bins(d, row, 8, 8, b0);
+    cdef_diag_bins(d, [&](const int i) { return hn::Reverse8(d, row(i)); },
+                   8, 8, b4);
+    const auto fold = [&](const int i) {
+        const auto v = row(i);
+        return hn::Add(hn::ConcatEven(d, v, v), hn::ConcatOdd(d, v, v));
+    };
+    cdef_diag_bins(d, fold, 8, 4, b1);
+    cdef_diag_bins(d, [&](const int i) { return hn::Reverse4(d, fold(i)); },
+                   8, 4, b3);
+    const auto zrow = [&](const int h) {
+        return hn::Add(row(2 * h), row(2 * h + 1));
+    };
+    cdef_diag_bins(d, zrow, 4, 8, b7);
+    cdef_diag_bins(d, [&](const int i) { return zrow(3 - i); }, 4, 8, b5);
+
+    auto colsum = hn::Zero(d);
+    for (int i = 0; i < 8; i++) {
+        const auto v = row(i);
+        colsum = hn::Add(colsum, v);
+        rs[i] = (int16_t) hn::ReduceSum(d, v);
+    }
+    hn::StoreN(colsum, d, cc, 8);
+
+    const hn::Repartition<int32_t, decltype(d)> d32;
+    unsigned cost[8];
+    cost[0] = cdef_bin_cost(d32, b0, kCdefWDiag);
+    cost[1] = cdef_bin_cost(d32, b1, kCdefWOdd);
+    cost[2] = cdef_bin_cost(d32, rs, kCdefW105);
+    cost[3] = cdef_bin_cost(d32, b3, kCdefWOdd);
+    cost[4] = cdef_bin_cost(d32, b4, kCdefWDiag);
+    cost[5] = cdef_bin_cost(d32, b5, kCdefWOdd);
+    cost[6] = cdef_bin_cost(d32, cc, kCdefW105);
+    cost[7] = cdef_bin_cost(d32, b7, kCdefWOdd);
+
+    int best_dir = 0;
+    unsigned best_cost = cost[0];
+    for (int n = 1; n < 8; n++) {
+        if (cost[n] > best_cost) {
+            best_cost = cost[n];
+            best_dir = n;
+        }
+    }
+
+    // best_cost is the maximum, so the subtraction is non-negative and the
+    // C unsigned shift is exact here as well.
+    *var = (best_cost - cost[best_dir ^ 4]) >> 10;
+    return best_dir;
+}
+
+int cdef_find_dir_8bpc(const uint8_t *const img, const ptrdiff_t stride,
+                       unsigned *const var)
+{
+    return cdef_find_dir(img, stride, var, 0);
+}
+
+int cdef_find_dir_16bpc(const uint16_t *const img, const ptrdiff_t stride,
+                        unsigned *const var, const int bitdepth_max)
+{
+    return cdef_find_dir(img, stride, var, hwy_ulog2(bitdepth_max) - 7);
+}
+
 }  // namespace HWY_NAMESPACE
 }  // namespace dav1d
 
@@ -395,6 +528,8 @@ HWY_EXPORT(cdef_filter_4x4_8bpc);
 HWY_EXPORT(cdef_filter_8x8_16bpc);
 HWY_EXPORT(cdef_filter_4x8_16bpc);
 HWY_EXPORT(cdef_filter_4x4_16bpc);
+HWY_EXPORT(cdef_find_dir_8bpc);
+HWY_EXPORT(cdef_find_dir_16bpc);
 }  // namespace dav1d
 
 namespace {
@@ -430,6 +565,7 @@ static void hwy_init_chosen_target() {
 
 static void cdef_dsp_init_8bpc_hwy(void *const c) {
     auto *const ctx = static_cast<CdefDSP8 *>(c);
+    ctx->dir = HWY_DYNAMIC_POINTER(cdef_find_dir_8bpc);
     ctx->fb[0] = HWY_DYNAMIC_POINTER(cdef_filter_8x8_8bpc);
     ctx->fb[1] = HWY_DYNAMIC_POINTER(cdef_filter_4x8_8bpc);
     ctx->fb[2] = HWY_DYNAMIC_POINTER(cdef_filter_4x4_8bpc);
@@ -437,6 +573,7 @@ static void cdef_dsp_init_8bpc_hwy(void *const c) {
 
 static void cdef_dsp_init_16bpc_hwy(void *const c) {
     auto *const ctx = static_cast<CdefDSP16 *>(c);
+    ctx->dir = HWY_DYNAMIC_POINTER(cdef_find_dir_16bpc);
     ctx->fb[0] = HWY_DYNAMIC_POINTER(cdef_filter_8x8_16bpc);
     ctx->fb[1] = HWY_DYNAMIC_POINTER(cdef_filter_4x8_16bpc);
     ctx->fb[2] = HWY_DYNAMIC_POINTER(cdef_filter_4x4_16bpc);
