@@ -371,6 +371,7 @@ if have_highway
     libdav1d_hwy_objs = static_library(
         'dav1d_hwy',
         files('hwy/cdef.cpp',
+              'hwy/filmgrain.cpp',
               'hwy/ipred.cpp',
               'hwy/loopfilter.cpp',
               'hwy/looprestoration.cpp',
