@@ -31,6 +31,7 @@
 #include "common/bitdepth.h"
 
 #include "src/cdef.h"
+#include "src/ipred.h"
 #include "src/loopfilter.h"
 #include "src/mc.h"
 
@@ -39,6 +40,7 @@
  * so asm takes precedence where it exists. */
 
 bitfn_decls(void dav1d_cdef_dsp_init_hwy, Dav1dCdefDSPContext *c);
+bitfn_decls(void dav1d_ipred_dsp_init_hwy, Dav1dIntraPredDSPContext *c);
 bitfn_decls(void dav1d_loop_filter_dsp_init_hwy, Dav1dLoopFilterDSPContext *c);
 bitfn_decls(void dav1d_mc_dsp_init_hwy, Dav1dMCDSPContext *c);
 bitfn_decls(void dav1d_mc_compound_dsp_init_hwy, Dav1dMCDSPContext *c);
