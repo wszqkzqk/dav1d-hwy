@@ -47,6 +47,7 @@
 #include "hwy/foreach_target.h"
 
 #include "hwy/highway.h"
+#include "src/hwy/common.h"
 
 // Defined in src/tables.c.
 extern "C" const int8_t dav1d_mc_subpel_filters[6][15][8];
@@ -59,18 +60,6 @@ namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
 
-// Matches ulog2() in include/common/intops.h.
-static inline int hwy_ulog2(const unsigned v) {
-#if defined(_MSC_VER) && !defined(__clang__)
-    if (!v) return -1;
-    unsigned long idx;
-    _BitScanReverse(&idx, v);
-    return (int) idx;
-#else
-    return v ? 31 - __builtin_clz(v) : -1;
-#endif
-}
-
 // enum Dav1dFilterMode in include/dav1d/headers.h.
 enum {
     kFilterRegular = 0,
@@ -80,44 +69,6 @@ enum {
 
 // Pitch of the horizontal-pass intermediate, as in src/mc_tmpl.c.
 constexpr int kMidStride = 128;
-
-// Loads n values as i16 lanes; lanes [n, Lanes) are zero. Source pixels are
-// <= 4095, so the u16->i16 bitcasts are exact. kFull selects unconditional
-// full-vector accesses: dav1d block widths >= 8 are multiples of 8, so the
-// partial (LoadN) path only ever sees w < 8.
-template <int kCap, class D16, typename Src>
-static HWY_INLINE hn::VFromD<D16> LoadI16(const D16 d, const Src *const p,
-                                          const size_t n) {
-    constexpr bool kFull = kCap != 0;
-    if constexpr (sizeof(Src) == 1) {
-        const hn::Rebind<uint8_t, D16> d8;
-        const hn::Rebind<uint16_t, D16> du16;
-        const auto v = kFull ? hn::LoadU(d8, p) : hn::LoadN(d8, p, n);
-        return hn::BitCast(d, hn::PromoteTo(du16, v));
-    } else if constexpr (std::is_same<Src, int16_t>::value) {
-        return kFull ? hn::LoadU(d, p) : hn::LoadN(d, p, n);
-    } else {
-        const hn::Rebind<uint16_t, D16> du16;
-        const auto v = kFull ? hn::LoadU(du16, p) : hn::LoadN(du16, p, n);
-        return hn::BitCast(d, v);
-    }
-}
-
-// Stores i16 lanes as pixels; v must already be clamped to [0, bitdepth_max],
-// so the narrowing is exact.
-template <int kCap, class D16, typename Pixel>
-static HWY_INLINE void StorePx(const D16, Pixel *const p, const size_t n,
-                               const hn::VFromD<D16> v) {
-    constexpr bool kFull = kCap != 0;
-    const hn::Rebind<Pixel, D16> dp;
-    if constexpr (sizeof(Pixel) == 1) {
-        const auto v8 = hn::DemoteTo(dp, v);
-        if (kFull) hn::StoreU(v8, dp, p); else hn::StoreN(v8, dp, p, n);
-    } else {
-        const auto v16 = hn::BitCast(dp, v);
-        if (kFull) hn::StoreU(v16, dp, p); else hn::StoreN(v16, dp, p, n);
-    }
-}
 
 // i16 store for the mid buffer and prep output.
 template <int kCap, class D16>
@@ -153,8 +104,7 @@ static HWY_INLINE hn::VFromD<D16> RoundPack(const D16 d, const V32 dot_e,
                           hn::ShiftRightSame(hn::Add(dot_o, vr), sh));
 }
 
-// Broadcast filter taps, built once per call (keeps the Set out of the
-// inner loops).
+// Broadcast filter taps, built once per call.
 template <class D16>
 static HWY_INLINE void LoadTaps(const D16 d, const int8_t *const F,
                                 hn::VFromD<D16> t[8]) {
@@ -246,8 +196,6 @@ static HWY_INLINE void Dot8H(const D16 d, const Src *const p,
                              const size_t n, const hn::VFromD<D16> F[8],
                              V32& dot_e, V32& dot_o) {
     const hn::Repartition<int32_t, D16> d32;
-    // Two accumulator chains per side: a single chain would serialize the
-    // widening multiplies' latency.
     auto dot_e0 = hn::Zero(d32);
     auto dot_e1 = hn::Zero(d32);
     auto dot_o0 = hn::Zero(d32);
@@ -302,8 +250,8 @@ static HWY_INLINE void Dot8V(const D16, const V16 rows[8],
 }
 
 // kCap == 4 horizontal pass, two rows at once (p0/p1 == row + x - 3): both
-// row windows are packed into one 8-lane vector per tap, halving the
-// widening-multiply count. Reads pixels [x-3, x+7], all within the range the
+// row windows are packed into one 8-lane vector per tap. Reads pixels
+// [x-3, x+7], all within the range the
 // C code reads. dot_e holds columns [r0c0, r0c2, r1c0, r1c2], dot_o the odd
 // ones; the InterleaveLower/Upper halves are the two rows in column order.
 template <bool k6tap, class D8, typename Src, class V32>
@@ -405,6 +353,152 @@ static HWY_INLINE hn::VFromD<D16> BilinDot(const D16 d, const Src *const p,
 // filter tables have F[0] == F[7] == 0 for every subpel position.
 static HWY_INLINE bool tap_6(const int8_t *const F) {
     return F[0] == 0 && F[7] == 0;
+}
+
+// Horizontal pass of the 8-tap filter shared by put/prep: filters the h + 7
+// rows starting at src - 3 * ss into the i16 mid buffer (stride ms) as
+// (dot + rnd_h) >> (6 - ib); the values fit int16 (see CombineEvenOdd).
+template <typename Pixel, int kCap, bool k6tap, class D16>
+static void hwy_8tap_h_pass(const D16 d, const int8_t *const fh,
+                            const hn::VFromD<D16> (&hf)[8],
+                            const Pixel *const src, const ptrdiff_t ss,
+                            const int w, const int h, const int ib,
+                            int16_t *const mid, const int ms) {
+    using DT32 = hn::Repartition<int32_t, D16>;
+    const int N = (int) hn::Lanes(d);
+    const int rnd_h = (1 << (6 - ib)) >> 1;
+    if constexpr (kCap == 4) {
+        // Two rows per 8-lane vector, see Dot8H2.
+        const hn::CappedTag<int16_t, 8> d8;
+        hn::VFromD<decltype(d8)> hf8[8];
+        LoadTaps(d8, fh, hf8);
+        const hn::Repartition<int32_t, decltype(d8)> d32w;
+        const Pixel *srow = src - 3 * ss;
+        int y = 0;
+        for (; y + 2 <= h + 7; y += 2, srow += 2 * ss) {
+            hn::VFromD<decltype(d32w)> dot_e, dot_o;
+            Dot8H2<k6tap>(d8, srow - 3, srow + ss - 3, hf8, dot_e, dot_o);
+            StorePackI16x4(hn::InterleaveLower(dot_e, dot_o), rnd_h,
+                           6 - ib, mid + y * ms);
+            StorePackI16x4(hn::InterleaveUpper(d32w, dot_e, dot_o),
+                           rnd_h, 6 - ib, mid + (y + 1) * ms);
+        }
+        if (y < h + 7) {
+            hn::VFromD<decltype(d32w)> dot_e, dot_o;
+            Dot8H2<k6tap>(d8, srow - 3, srow - 3, hf8, dot_e, dot_o);
+            StorePackI16x4(hn::InterleaveLower(dot_e, dot_o), rnd_h,
+                           6 - ib, mid + y * ms);
+        }
+    } else if constexpr (kCap == 8) {
+        const Pixel *srow = src - 3 * ss;
+        int y = 0;
+        for (; y + 2 <= h + 7; y += 2, srow += 2 * ss)
+            for (int x = 0; x < w; x += N) {
+                const size_t n = (size_t) (w - x < N ? w - x : N);
+                hn::VFromD<DT32> dot_e, dot_o;
+                Dot8H<kCap, k6tap>(d, srow + x - 3, n, hf, dot_e, dot_o);
+                StorePackI16<kCap>(d, mid + y * ms + x, n,
+                                   dot_e, dot_o, rnd_h, 6 - ib);
+                Dot8H<kCap, k6tap>(d, srow + ss + x - 3, n, hf, dot_e, dot_o);
+                StorePackI16<kCap>(d, mid + (y + 1) * ms + x, n,
+                                   dot_e, dot_o, rnd_h, 6 - ib);
+            }
+        for (; y < h + 7; y++, srow += ss)
+            for (int x = 0; x < w; x += N) {
+                const size_t n = (size_t) (w - x < N ? w - x : N);
+                hn::VFromD<DT32> dot_e, dot_o;
+                Dot8H<kCap, k6tap>(d, srow + x - 3, n, hf, dot_e, dot_o);
+                StorePackI16<kCap>(d, mid + y * ms + x, n,
+                                   dot_e, dot_o, rnd_h, 6 - ib);
+            }
+    } else {
+        const Pixel *srow = src - 3 * ss;
+        for (int y = 0; y < h + 7; y++, srow += ss)
+            for (int x = 0; x < w; x += N) {
+                const size_t n = (size_t) (w - x < N ? w - x : N);
+                hn::VFromD<DT32> dot_e, dot_o;
+                Dot8H<kCap, k6tap>(d, srow + x - 3, n, hf, dot_e, dot_o);
+                StorePackI16<kCap>(d, mid + y * ms + x, n,
+                                   dot_e, dot_o, rnd_h, 6 - ib);
+            }
+    }
+}
+
+// Vertical pass over the h + 7-row mid buffer, shared by put/prep: Dot8V
+// over the sliding 8/9-row window per column block; store(orow, dot_e,
+// dot_o, n) rounds/clips/writes one output row, orow advances os per row.
+template <int kCap, bool k6tap, class D16, typename Out, class Store>
+static HWY_INLINE void hwy_8tap_v_pass(const D16 d, const int16_t *const mid,
+                                       Out *const out, const ptrdiff_t os,
+                                       const int w, const int h,
+                                       const hn::VFromD<D16> (&vf)[8],
+                                       const Store& store) {
+    using DT32 = hn::Repartition<int32_t, D16>;
+    const int N = (int) hn::Lanes(d);
+    for (int x = 0; x < w; x += N) {
+        const size_t n = (size_t) (w - x < N ? w - x : N);
+        const int16_t *mrow = mid + x;
+        Out *orow = out + x;
+        int y = 0;
+        // Two output rows per iteration: they share 7 of 9 inputs.
+        for (; y + 2 <= h; y += 2, mrow += 2 * w, orow += 2 * os) {
+            hn::VFromD<D16> rows[9];
+            for (int k = 0; k < 9; k++)
+                rows[k] = LoadI16<kCap>(d, mrow + k * w, n);
+            hn::VFromD<DT32> dot_e, dot_o;
+            Dot8V<k6tap>(d, rows, vf, dot_e, dot_o);
+            store(orow, dot_e, dot_o, n);
+            Dot8V<k6tap>(d, rows + 1, vf, dot_e, dot_o);
+            store(orow + os, dot_e, dot_o, n);
+        }
+        for (; y < h; y++, mrow += w, orow += os) {
+            hn::VFromD<D16> rows[8];
+            for (int k = 0; k < 8; k++)
+                rows[k] = LoadI16<kCap>(d, mrow + k * w, n);
+            hn::VFromD<DT32> dot_e, dot_o;
+            Dot8V<k6tap>(d, rows, vf, dot_e, dot_o);
+            store(orow, dot_e, dot_o, n);
+        }
+    }
+}
+
+// Same loop structure with the filter window sliding over the source rows
+// (my == 0 in put/prep), so the loads are pixels along ss.
+template <typename Pixel, int kCap, bool k6tap, class D16, typename Out,
+          class Store>
+static HWY_INLINE void hwy_8tap_v_only(const D16 d, const Pixel *const src,
+                                       const ptrdiff_t ss, Out *const out,
+                                       const ptrdiff_t os, const int w,
+                                       const int h,
+                                       const hn::VFromD<D16> (&vf)[8],
+                                       const Store& store) {
+    using DT32 = hn::Repartition<int32_t, D16>;
+    const int N = (int) hn::Lanes(d);
+    for (int x = 0; x < w; x += N) {
+        const size_t n = (size_t) (w - x < N ? w - x : N);
+        const Pixel *srow = src + x - 3 * ss;
+        Out *orow = out + x;
+        int y = 0;
+        // Two output rows per iteration: they share 7 of 9 inputs.
+        for (; y + 2 <= h; y += 2, srow += 2 * ss, orow += 2 * os) {
+            hn::VFromD<D16> rows[9];
+            for (int k = 0; k < 9; k++)
+                rows[k] = LoadI16<kCap>(d, srow + k * ss, n);
+            hn::VFromD<DT32> dot_e, dot_o;
+            Dot8V<k6tap>(d, rows, vf, dot_e, dot_o);
+            store(orow, dot_e, dot_o, n);
+            Dot8V<k6tap>(d, rows + 1, vf, dot_e, dot_o);
+            store(orow + os, dot_e, dot_o, n);
+        }
+        for (; y < h; y++, srow += ss, orow += os) {
+            hn::VFromD<D16> rows[8];
+            for (int k = 0; k < 8; k++)
+                rows[k] = LoadI16<kCap>(d, srow + k * ss, n);
+            hn::VFromD<DT32> dot_e, dot_o;
+            Dot8V<k6tap>(d, rows, vf, dot_e, dot_o);
+            store(orow, dot_e, dot_o, n);
+        }
+    }
 }
 
 // Phase 0 of the scaled horizontal pass takes the unfiltered path in C
@@ -516,7 +610,7 @@ static HWY_INLINE int ScaledHInit(const D16 d, const int w, const int mx,
 }
 
 // Same, for the bilinear scaled kernels: per-lane constant pairs holding
-// interleaved 16 - m / m multipliers (m = imx >> 6) instead of tap matrices.
+// interleaved 16 - m / m multipliers (m = imx >> 6).
 template <class D16>
 static HWY_INLINE int ScaledHInitBilin(const D16 d, const int w, const int mx,
                                        const int dx, int32_t off[16][8],
@@ -651,106 +745,27 @@ static void hwy_put_8tap_impl(Pixel *const dst, const ptrdiff_t dst_stride,
 
     if (fh) {
         hn::VFromD<DT16> hf[8]; LoadTaps(d, fh, hf);
-        const auto h_pass = [&](auto k6, int16_t *const mid, const int ms) {
-            constexpr bool k6v = decltype(k6)::value;
-            const int rnd_h = (1 << (6 - ib)) >> 1;
-            if constexpr (kCap == 4) {
-                // Two rows per 8-lane vector, see Dot8H2.
-                const hn::CappedTag<int16_t, 8> d8;
-                hn::VFromD<decltype(d8)> hf8[8];
-                LoadTaps(d8, fh, hf8);
-                const hn::Repartition<int32_t, decltype(d8)> d32w;
-                const Pixel *srow = src - 3 * ss;
-                int y = 0;
-                for (; y + 2 <= h + 7; y += 2, srow += 2 * ss) {
-                    hn::VFromD<decltype(d32w)> dot_e, dot_o;
-                    Dot8H2<k6v>(d8, srow - 3, srow + ss - 3, hf8, dot_e, dot_o);
-                    StorePackI16x4(hn::InterleaveLower(dot_e, dot_o), rnd_h,
-                                   6 - ib, mid + y * ms);
-                    StorePackI16x4(hn::InterleaveUpper(d32w, dot_e, dot_o),
-                                   rnd_h, 6 - ib, mid + (y + 1) * ms);
-                }
-                if (y < h + 7) {
-                    hn::VFromD<decltype(d32w)> dot_e, dot_o;
-                    Dot8H2<k6v>(d8, srow - 3, srow - 3, hf8, dot_e, dot_o);
-                    StorePackI16x4(hn::InterleaveLower(dot_e, dot_o), rnd_h,
-                                   6 - ib, mid + y * ms);
-                }
-            } else if constexpr (kCap == 8) {
-                // Two rows per iteration: independent dot chains, half the
-                // loop overhead.
-                const Pixel *srow = src - 3 * ss;
-                int y = 0;
-                for (; y + 2 <= h + 7; y += 2, srow += 2 * ss)
-                    for (int x = 0; x < w; x += N) {
-                        const size_t n = (size_t) (w - x < N ? w - x : N);
-                        hn::VFromD<DT32> dot_e, dot_o;
-                        Dot8H<kCap, k6v>(d, srow + x - 3, n, hf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, mid + y * ms + x, n,
-                                           dot_e, dot_o, rnd_h, 6 - ib);
-                        Dot8H<kCap, k6v>(d, srow + ss + x - 3, n, hf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, mid + (y + 1) * ms + x, n,
-                                           dot_e, dot_o, rnd_h, 6 - ib);
-                    }
-                for (; y < h + 7; y++, srow += ss)
-                    for (int x = 0; x < w; x += N) {
-                        const size_t n = (size_t) (w - x < N ? w - x : N);
-                        hn::VFromD<DT32> dot_e, dot_o;
-                        Dot8H<kCap, k6v>(d, srow + x - 3, n, hf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, mid + y * ms + x, n,
-                                           dot_e, dot_o, rnd_h, 6 - ib);
-                    }
-            } else {
-                const Pixel *srow = src - 3 * ss;
-                for (int y = 0; y < h + 7; y++, srow += ss)
-                    for (int x = 0; x < w; x += N) {
-                        const size_t n = (size_t) (w - x < N ? w - x : N);
-                        hn::VFromD<DT32> dot_e, dot_o;
-                        Dot8H<kCap, k6v>(d, srow + x - 3, n, hf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, mid + y * ms + x, n,
-                                           dot_e, dot_o, rnd_h, 6 - ib);
-                    }
-            }
-        };
         if (fv) {
             hn::VFromD<DT16> vf[8]; LoadTaps(d, fv, vf);
             int16_t mid[kMidStride * 135];
-            if (tap_6(fh)) h_pass(std::true_type{}, mid, w);
-            else h_pass(std::false_type{}, mid, w);
+            if (tap_6(fh))
+                hwy_8tap_h_pass<Pixel, kCap, true>(d, fh, hf, src, ss, w, h,
+                                                   ib, mid, w);
+            else
+                hwy_8tap_h_pass<Pixel, kCap, false>(d, fh, hf, src, ss, w, h,
+                                                    ib, mid, w);
             const int rnd_v = (1 << (6 + ib)) >> 1;
-            const auto v_pass = [&](auto k6) {
-                constexpr bool k6v = decltype(k6)::value;
-                for (int x = 0; x < w; x += N) {
-                    const size_t n = (size_t) (w - x < N ? w - x : N);
-                    const int16_t *mrow = mid + x;
-                    Pixel *drow = dst + x;
-                    int y = 0;
-                    // Two output rows per iteration: they share 7 of 9 inputs.
-                    for (; y + 2 <= h; y += 2, mrow += 2 * w, drow += 2 * ds) {
-                        hn::VFromD<DT16> rows[9];
-                        for (int k = 0; k < 9; k++)
-                            rows[k] = LoadI16<kCap>(d, mrow + k * w, n);
-                        hn::VFromD<DT32> dot_e, dot_o;
-                        Dot8V<k6v>(d, rows, vf, dot_e, dot_o);
-                        StorePackPx<kCap>(d, drow, n, dot_e, dot_o, rnd_v,
-                                          6 + ib, bitdepth_max);
-                        Dot8V<k6v>(d, rows + 1, vf, dot_e, dot_o);
-                        StorePackPx<kCap>(d, drow + ds, n, dot_e, dot_o, rnd_v,
-                                          6 + ib, bitdepth_max);
-                    }
-                    for (; y < h; y++, mrow += w, drow += ds) {
-                        hn::VFromD<DT16> rows[8];
-                        for (int k = 0; k < 8; k++)
-                            rows[k] = LoadI16<kCap>(d, mrow + k * w, n);
-                        hn::VFromD<DT32> dot_e, dot_o;
-                        Dot8V<k6v>(d, rows, vf, dot_e, dot_o);
-                        StorePackPx<kCap>(d, drow, n, dot_e, dot_o, rnd_v,
-                                          6 + ib, bitdepth_max);
-                    }
-                }
+            const auto store_px = [&](Pixel *const p, auto dot_e, auto dot_o,
+                                      const size_t n) {
+                StorePackPx<kCap>(d, p, n, dot_e, dot_o, rnd_v, 6 + ib,
+                                  bitdepth_max);
             };
-            if (tap_6(fv)) v_pass(std::true_type{});
-            else v_pass(std::false_type{});
+            if (tap_6(fv))
+                hwy_8tap_v_pass<kCap, true>(d, mid, dst, ds, w, h, vf,
+                                            store_px);
+            else
+                hwy_8tap_v_pass<kCap, false>(d, mid, dst, ds, w, h, vf,
+                                             store_px);
         } else {
             const int rnd = 32 + ((1 << (6 - ib)) >> 1);
             const auto h_only = [&](auto k6) {
@@ -796,39 +811,16 @@ static void hwy_put_8tap_impl(Pixel *const dst, const ptrdiff_t dst_stride,
         }
     } else if (fv) {
         hn::VFromD<DT16> vf[8]; LoadTaps(d, fv, vf);
-        const auto v_only = [&](auto k6) {
-            constexpr bool k6v = decltype(k6)::value;
-            for (int x = 0; x < w; x += N) {
-                const size_t n = (size_t) (w - x < N ? w - x : N);
-                const Pixel *srow = src + x - 3 * ss;
-                Pixel *drow = dst + x;
-                int y = 0;
-                // Two output rows per iteration: they share 7 of 9 inputs.
-                for (; y + 2 <= h; y += 2, srow += 2 * ss, drow += 2 * ds) {
-                    hn::VFromD<DT16> rows[9];
-                    for (int k = 0; k < 9; k++)
-                        rows[k] = LoadI16<kCap>(d, srow + k * ss, n);
-                    hn::VFromD<DT32> dot_e, dot_o;
-                    Dot8V<k6v>(d, rows, vf, dot_e, dot_o);
-                    StorePackPx<kCap>(d, drow, n, dot_e, dot_o, 32, 6,
-                                      bitdepth_max);
-                    Dot8V<k6v>(d, rows + 1, vf, dot_e, dot_o);
-                    StorePackPx<kCap>(d, drow + ds, n, dot_e, dot_o, 32, 6,
-                                      bitdepth_max);
-                }
-                for (; y < h; y++, srow += ss, drow += ds) {
-                    hn::VFromD<DT16> rows[8];
-                    for (int k = 0; k < 8; k++)
-                        rows[k] = LoadI16<kCap>(d, srow + k * ss, n);
-                    hn::VFromD<DT32> dot_e, dot_o;
-                    Dot8V<k6v>(d, rows, vf, dot_e, dot_o);
-                    StorePackPx<kCap>(d, drow, n, dot_e, dot_o, 32, 6,
-                                      bitdepth_max);
-                }
-            }
+        const auto store_px = [&](Pixel *const p, auto dot_e, auto dot_o,
+                                  const size_t n) {
+            StorePackPx<kCap>(d, p, n, dot_e, dot_o, 32, 6, bitdepth_max);
         };
-        if (tap_6(fv)) v_only(std::true_type{});
-        else v_only(std::false_type{});
+        if (tap_6(fv))
+            hwy_8tap_v_only<Pixel, kCap, true>(d, src, ss, dst, ds, w, h, vf,
+                                               store_px);
+        else
+            hwy_8tap_v_only<Pixel, kCap, false>(d, src, ss, dst, ds, w, h, vf,
+                                                store_px);
     } else
         hwy_put_c<Pixel, kCap>(dst, ds, src, ss, w, h);
 }
@@ -856,110 +848,31 @@ static void hwy_prep_8tap_impl(int16_t *tmp, const Pixel *const src,
 
     if (fh) {
         hn::VFromD<DT16> hf[8]; LoadTaps(d, fh, hf);
-        const auto h_pass = [&](auto k6, int16_t *const mid, const int ms) {
-            constexpr bool k6v = decltype(k6)::value;
-            const int rnd_h = (1 << (6 - ib)) >> 1;
-            if constexpr (kCap == 4) {
-                // Two rows per 8-lane vector, see Dot8H2.
-                const hn::CappedTag<int16_t, 8> d8;
-                hn::VFromD<decltype(d8)> hf8[8];
-                LoadTaps(d8, fh, hf8);
-                const hn::Repartition<int32_t, decltype(d8)> d32w;
-                const Pixel *srow = src - 3 * ss;
-                int y = 0;
-                for (; y + 2 <= h + 7; y += 2, srow += 2 * ss) {
-                    hn::VFromD<decltype(d32w)> dot_e, dot_o;
-                    Dot8H2<k6v>(d8, srow - 3, srow + ss - 3, hf8, dot_e, dot_o);
-                    StorePackI16x4(hn::InterleaveLower(dot_e, dot_o), rnd_h,
-                                   6 - ib, mid + y * ms);
-                    StorePackI16x4(hn::InterleaveUpper(d32w, dot_e, dot_o),
-                                   rnd_h, 6 - ib, mid + (y + 1) * ms);
-                }
-                if (y < h + 7) {
-                    hn::VFromD<decltype(d32w)> dot_e, dot_o;
-                    Dot8H2<k6v>(d8, srow - 3, srow - 3, hf8, dot_e, dot_o);
-                    StorePackI16x4(hn::InterleaveLower(dot_e, dot_o), rnd_h,
-                                   6 - ib, mid + y * ms);
-                }
-            } else if constexpr (kCap == 8) {
-                // Two rows per iteration: independent dot chains, half the
-                // loop overhead.
-                const Pixel *srow = src - 3 * ss;
-                int y = 0;
-                for (; y + 2 <= h + 7; y += 2, srow += 2 * ss)
-                    for (int x = 0; x < w; x += N) {
-                        const size_t n = (size_t) (w - x < N ? w - x : N);
-                        hn::VFromD<DT32> dot_e, dot_o;
-                        Dot8H<kCap, k6v>(d, srow + x - 3, n, hf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, mid + y * ms + x, n,
-                                           dot_e, dot_o, rnd_h, 6 - ib);
-                        Dot8H<kCap, k6v>(d, srow + ss + x - 3, n, hf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, mid + (y + 1) * ms + x, n,
-                                           dot_e, dot_o, rnd_h, 6 - ib);
-                    }
-                for (; y < h + 7; y++, srow += ss)
-                    for (int x = 0; x < w; x += N) {
-                        const size_t n = (size_t) (w - x < N ? w - x : N);
-                        hn::VFromD<DT32> dot_e, dot_o;
-                        Dot8H<kCap, k6v>(d, srow + x - 3, n, hf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, mid + y * ms + x, n,
-                                           dot_e, dot_o, rnd_h, 6 - ib);
-                    }
-            } else {
-                const Pixel *srow = src - 3 * ss;
-                for (int y = 0; y < h + 7; y++, srow += ss)
-                    for (int x = 0; x < w; x += N) {
-                        const size_t n = (size_t) (w - x < N ? w - x : N);
-                        hn::VFromD<DT32> dot_e, dot_o;
-                        Dot8H<kCap, k6v>(d, srow + x - 3, n, hf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, mid + y * ms + x, n,
-                                           dot_e, dot_o, rnd_h, 6 - ib);
-                    }
-            }
-        };
         if (fv) {
             hn::VFromD<DT16> vf[8]; LoadTaps(d, fv, vf);
             int16_t mid[kMidStride * 135];
-            if (tap_6(fh)) h_pass(std::true_type{}, mid, w);
-            else h_pass(std::false_type{}, mid, w);
-            const auto v_pass = [&](auto k6) {
-                constexpr bool k6v = decltype(k6)::value;
-                for (int x = 0; x < w; x += N) {
-                    const size_t n = (size_t) (w - x < N ? w - x : N);
-                    const int16_t *mrow = mid + x;
-                    int16_t *trow = tmp + x;
-                    int y = 0;
-                    // Two output rows per iteration: they share 7 of 9 inputs.
-                    for (; y + 2 <= h; y += 2, mrow += 2 * w, trow += 2 * w) {
-                        hn::VFromD<DT16> rows[9];
-                        for (int k = 0; k < 9; k++)
-                            rows[k] = LoadI16<kCap>(d, mrow + k * w, n);
-                        // (dot + 32) >> 6 - PREP_BIAS, computed as
-                        // (dot + 32 - (PREP_BIAS << 6)) >> 6 (equal for
-                        // arithmetic shifts): the pre-bias value can exceed
-                        // int16 (up to 36985), so the bias must be folded in
-                        // before the i32 -> i16 pack, not subtracted after it.
-                        hn::VFromD<DT32> dot_e, dot_o;
-                        Dot8V<k6v>(d, rows, vf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, trow, n, dot_e, dot_o,
-                                           32 - (prep_bias << 6), 6);
-                        Dot8V<k6v>(d, rows + 1, vf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, trow + w, n, dot_e, dot_o,
-                                           32 - (prep_bias << 6), 6);
-                    }
-                    for (; y < h; y++, mrow += w, trow += w) {
-                        hn::VFromD<DT16> rows[8];
-                        for (int k = 0; k < 8; k++)
-                            rows[k] = LoadI16<kCap>(d, mrow + k * w, n);
-                        hn::VFromD<DT32> dot_e, dot_o;
-                        Dot8V<k6v>(d, rows, vf, dot_e, dot_o);
-                        StorePackI16<kCap>(d, trow, n, dot_e, dot_o,
-                                           32 - (prep_bias << 6), 6);
-                    }
-                }
+            if (tap_6(fh))
+                hwy_8tap_h_pass<Pixel, kCap, true>(d, fh, hf, src, ss, w, h,
+                                                   ib, mid, w);
+            else
+                hwy_8tap_h_pass<Pixel, kCap, false>(d, fh, hf, src, ss, w, h,
+                                                    ib, mid, w);
+            // (dot + 32) >> 6 - PREP_BIAS, computed as
+            // (dot + 32 - (PREP_BIAS << 6)) >> 6 (equal for arithmetic
+            // shifts): the pre-bias value can exceed int16 (up to 36985), so
+            // the bias must be folded in before the i32 -> i16 pack, not
+            // subtracted after it.
+            const auto store_i16 = [&](int16_t *const p, auto dot_e,
+                                       auto dot_o, const size_t n) {
+                StorePackI16<kCap>(d, p, n, dot_e, dot_o,
+                                   32 - (prep_bias << 6), 6);
             };
-            if (tap_6(fv)) v_pass(std::true_type{});
-            else v_pass(std::false_type{});
+            if (tap_6(fv))
+                hwy_8tap_v_pass<kCap, true>(d, mid, tmp, w, w, h, vf,
+                                            store_i16);
+            else
+                hwy_8tap_v_pass<kCap, false>(d, mid, tmp, w, w, h, vf,
+                                             store_i16);
         } else {
             const auto h_only = [&](auto k6) {
                 constexpr bool k6v = decltype(k6)::value;
@@ -1008,39 +921,17 @@ static void hwy_prep_8tap_impl(int16_t *tmp, const Pixel *const src,
     } else if (fv) {
         hn::VFromD<DT16> vf[8]; LoadTaps(d, fv, vf);
         const int rnd = (1 << (6 - ib)) >> 1;
-        const auto v_only = [&](auto k6) {
-            constexpr bool k6v = decltype(k6)::value;
-            for (int x = 0; x < w; x += N) {
-                const size_t n = (size_t) (w - x < N ? w - x : N);
-                const Pixel *srow = src + x - 3 * ss;
-                int16_t *trow = tmp + x;
-                int y = 0;
-                // Two output rows per iteration: they share 7 of 9 inputs.
-                for (; y + 2 <= h; y += 2, srow += 2 * ss, trow += 2 * w) {
-                    hn::VFromD<DT16> rows[9];
-                    for (int k = 0; k < 9; k++)
-                        rows[k] = LoadI16<kCap>(d, srow + k * ss, n);
-                    hn::VFromD<DT32> dot_e, dot_o;
-                    Dot8V<k6v>(d, rows, vf, dot_e, dot_o);
-                    StorePackI16<kCap>(d, trow, n, dot_e, dot_o,
-                                       rnd - (prep_bias << (6 - ib)), 6 - ib);
-                    Dot8V<k6v>(d, rows + 1, vf, dot_e, dot_o);
-                    StorePackI16<kCap>(d, trow + w, n, dot_e, dot_o,
-                                       rnd - (prep_bias << (6 - ib)), 6 - ib);
-                }
-                for (; y < h; y++, srow += ss, trow += w) {
-                    hn::VFromD<DT16> rows[8];
-                    for (int k = 0; k < 8; k++)
-                        rows[k] = LoadI16<kCap>(d, srow + k * ss, n);
-                    hn::VFromD<DT32> dot_e, dot_o;
-                    Dot8V<k6v>(d, rows, vf, dot_e, dot_o);
-                    StorePackI16<kCap>(d, trow, n, dot_e, dot_o,
-                                       rnd - (prep_bias << (6 - ib)), 6 - ib);
-                }
-            }
+        const auto store_i16 = [&](int16_t *const p, auto dot_e, auto dot_o,
+                                   const size_t n) {
+            StorePackI16<kCap>(d, p, n, dot_e, dot_o,
+                               rnd - (prep_bias << (6 - ib)), 6 - ib);
         };
-        if (tap_6(fv)) v_only(std::true_type{});
-        else v_only(std::false_type{});
+        if (tap_6(fv))
+            hwy_8tap_v_only<Pixel, kCap, true>(d, src, ss, tmp, w, w, h, vf,
+                                               store_i16);
+        else
+            hwy_8tap_v_only<Pixel, kCap, false>(d, src, ss, tmp, w, w, h, vf,
+                                                store_i16);
     } else
         hwy_prep_c<Pixel, kCap>(tmp, src, ss, w, h, ib, prep_bias);
 }
@@ -1441,8 +1332,7 @@ static void hwy_prep_bilin_scaled_impl(int16_t *tmp, const Pixel *const src,
 
 // warp_affine_8x8_c / warp_affine_8x8t_c from src/mc_tmpl.c. Filter taps vary
 // per column (tmx/tmy per 4x4 sub-block coordinate), so both passes use
-// transposed per-column tap matrices (LoadTapsT) instead of broadcasts.
-// Intermediate ranges over dav1d_mc_warp_filter (max positive tap sum 175,
+// transposed per-column tap matrices (LoadTapsT). Intermediate ranges over dav1d_mc_warp_filter (max positive tap sum 175,
 // negative -47): h-pass output in [-6015, 22395], v-pass dot in i32.
 template <typename Pixel, bool kTmp, typename Dst>
 static void hwy_warp8x8_impl(Dst *const dst, const ptrdiff_t dst_stride,
@@ -2026,13 +1916,6 @@ struct McDSP16 {
 }  // namespace
 
 namespace dav1d {
-
-// Resolve the best per-target function pointers once at init; the
-// ChosenTarget must be initialized first or the tables yield their
-// re-dispatching first entry.
-static void hwy_init_chosen_target() {
-    hwy::GetChosenTarget().Update(hwy::SupportedTargets());
-}
 
 // enum Filter2d order in src/levels.h (horizontal-major).
 static void mc_dsp_init_8bpc_hwy(void *const c) {

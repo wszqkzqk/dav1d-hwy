@@ -44,6 +44,7 @@
 #include "hwy/foreach_target.h"
 
 #include "hwy/highway.h"
+#include "src/hwy/common.h"
 
 // src/scan.c. Populated by dav1d_init_last_nonzero_col_from_eob_tables(), which
 // dav1d_itx_dsp_init() runs whenever any function installed here can survive
@@ -1097,40 +1098,6 @@ static inline hn::VFromD<D32> hwy_load_coef(const D32 d32, const Coef *const p,
     }
 }
 
-// Widens pixel lanes (u8/u16, values <= 4095) to int32 lanes.
-template <typename Pixel, class D32>
-static inline hn::VFromD<D32> hwy_load_px(const D32 d32, const Pixel *const p,
-                                          const int n)
-{
-    const hn::Rebind<Pixel, D32> dp;
-    const int L = (int) hn::Lanes(d32);
-    const auto v = n >= L ? hn::LoadU(dp, p) : hn::LoadN(dp, p, n);
-    if constexpr (sizeof(Pixel) == 1) {
-        const hn::Rebind<uint16_t, D32> du16;
-        return hn::PromoteTo(d32, hn::PromoteTo(du16, v));
-    } else {
-        return hn::PromoteTo(d32, v);
-    }
-}
-
-// Stores int32 lanes as pixels; the caller has clamped to [0, bitdepth_max],
-// so the narrowing demotions are exact.
-template <typename Pixel, class D32>
-static inline void hwy_store_px(Pixel *const p, const D32 d32,
-                                const hn::VFromD<D32> v, const int n)
-{
-    const hn::Rebind<Pixel, D32> dp;
-    const int L = (int) hn::Lanes(d32);
-    if constexpr (sizeof(Pixel) == 1) {
-        const hn::Rebind<uint16_t, D32> du16;
-        const auto v8 = hn::DemoteTo(dp, hn::DemoteTo(du16, v));
-        if (n >= L) hn::StoreU(v8, dp, p); else hn::StoreN(v8, dp, p, n);
-    } else {
-        const auto v16 = hn::DemoteTo(dp, v);
-        if (n >= L) hn::StoreU(v16, dp, p); else hn::StoreN(v16, dp, p, n);
-    }
-}
-
 // Port of inv_txfm_add_c (src/itx_tmpl.c) for square transforms (never
 // is_rect2), with 1D types T1 (first pass, over the column-major coeff
 // layout) and T2 (second pass). The dav1d coeff layout is column-major
@@ -1342,13 +1309,6 @@ struct ItxDSP16 {
 }  // namespace
 
 namespace dav1d {
-
-// Resolve the best per-target function pointers once at init; the
-// ChosenTarget must be initialized first or the tables yield their
-// re-dispatching first entry.
-static void hwy_init_chosen_target() {
-    hwy::GetChosenTarget().Update(hwy::SupportedTargets());
-}
 
 /* dav1d assigns each asymmetric pair to the swapped enum slot: the function
  * adst_dct implements enum DCT_ADST, etc. (assign_itx_all_fn16 in

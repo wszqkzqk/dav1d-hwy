@@ -31,8 +31,7 @@
 // Bit-exact with the C code; warp8x8 and the scaled mc variants are not
 // covered.
 //
-// Vectors are capped at 128 bits (dav1d block widths are small, and wider
-// x86 targets would only pay for the extra lane shuffles here). All widening
+// Vectors are capped at 128 bits. All widening
 // is done on sequential half vectors (PromoteTo of Lower/UpperHalf) rather
 // than MulEven/MulOdd, so no deinterleaving/reinterleaving shuffles are
 // needed; the i32 -> i16 pack is a pair of plain narrowing stores.
@@ -53,6 +52,7 @@
 #include "hwy/foreach_target.h"
 
 #include "hwy/highway.h"
+#include "src/hwy/common.h"
 
 // Defined in src/tables.c.
 extern "C" const uint8_t dav1d_obmc_masks[64];
@@ -64,18 +64,6 @@ namespace dav1d {
 namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
-
-// Matches ulog2() in include/common/intops.h.
-static inline int hwy_ulog2(const unsigned v) {
-#if defined(_MSC_VER) && !defined(__clang__)
-    if (!v) return -1;
-    unsigned long idx;
-    _BitScanReverse(&idx, v);
-    return (int) idx;
-#else
-    return v ? 31 - __builtin_clz(v) : -1;
-#endif
-}
 
 // intermediate_bits/PREP_BIAS of src/mc_tmpl.c: the prep output is scaled by
 // 2^intermediate_bits and biased so that it fits int16.
@@ -89,64 +77,6 @@ static HWY_INLINE void mc_intermediate(const int bitdepth_max, int& ib,
         ib = 13 - hwy_ulog2((unsigned) bitdepth_max);
         bias = 8192;
     }
-}
-
-// Loads n values as i16 lanes; lanes [n, Lanes) are zero. Source pixels are
-// <= 4095, so the u16->i16 bitcasts are exact. kFull selects unconditional
-// full-vector accesses: dav1d block widths >= 8 are multiples of 8, so the
-// partial (LoadN) path only ever sees w < 8.
-template <int kCap, class D16, typename Src>
-static HWY_INLINE hn::VFromD<D16> LoadI16(const D16 d, const Src *const p,
-                                          const size_t n) {
-    constexpr bool kFull = kCap != 0;
-    if constexpr (sizeof(Src) == 1) {
-        const hn::Rebind<uint8_t, D16> d8;
-        const hn::Rebind<uint16_t, D16> du16;
-        const auto v = kFull ? hn::LoadU(d8, p) : hn::LoadN(d8, p, n);
-        return hn::BitCast(d, hn::PromoteTo(du16, v));
-    } else if constexpr (std::is_same<Src, int16_t>::value) {
-        return kFull ? hn::LoadU(d, p) : hn::LoadN(d, p, n);
-    } else {
-        const hn::Rebind<uint16_t, D16> du16;
-        const auto v = kFull ? hn::LoadU(du16, p) : hn::LoadN(du16, p, n);
-        return hn::BitCast(d, v);
-    }
-}
-
-// Stores i16 lanes as pixels; v must already be clamped to [0, bitdepth_max],
-// so the narrowing is exact.
-template <int kCap, class D16, typename Pixel>
-static HWY_INLINE void StorePx(const D16, Pixel *const p, const size_t n,
-                               const hn::VFromD<D16> v) {
-    constexpr bool kFull = kCap != 0;
-    const hn::Rebind<Pixel, D16> dp;
-    if constexpr (sizeof(Pixel) == 1) {
-        const auto v8 = hn::DemoteTo(dp, v);
-        if (kFull) hn::StoreU(v8, dp, p); else hn::StoreN(v8, dp, p, n);
-    } else {
-        const auto v16 = hn::BitCast(dp, v);
-        if (kFull) hn::StoreU(v16, dp, p); else hn::StoreN(v16, dp, p, n);
-    }
-}
-
-// i16 -> i32 of the sequential lower/upper half (column order, unlike
-// MulEven/MulOdd).
-template <class D32, class V16>
-static HWY_INLINE hn::VFromD<D32> WidenLo(const D32 d32, const V16 v) {
-    return hn::PromoteTo(d32, hn::LowerHalf(v));
-}
-template <class D32, class V16>
-static HWY_INLINE hn::VFromD<D32> WidenHi(const D32 d32, const V16 v) {
-    return hn::PromoteUpperTo(d32, v);
-}
-
-// Packs i32 lo/hi half results back into i16 column order; the demote
-// saturates (harmless for all callers, see the header comment).
-template <class D16, class V32>
-static HWY_INLINE hn::VFromD<D16> PackHalves(const D16 d, const V32 lo,
-                                             const V32 hi) {
-    const hn::Rebind<int16_t, hn::DFromV<V32>> dh;
-    return hn::Combine(d, hn::DemoteTo(dh, hi), hn::DemoteTo(dh, lo));
 }
 
 // ((dot + rnd) >> sh) clipped to [0, bitdepth_max], stored as pixels.
@@ -368,7 +298,7 @@ static void hwy_w_mask_impl(Pixel *dst, const ptrdiff_t dst_stride,
 // clip; a, b are valid pixels and m in [0, 64], so the result is already
 // within [0, bitdepth_max]. 8bpc works on whole u8 vectors: every
 // intermediate <= 255 * 64 + 32 = 16352 fits u16, so the zext/multiplies are
-// exact (umull/umlal on NEON) and 64 - m is exact in u8.
+// exact and 64 - m is exact in u8.
 template <class D8, class V8>
 static HWY_INLINE hn::VFromD<D8> BlendPx8(const D8 d8, const V8 a, const V8 b,
                                           const V8 m) {
@@ -999,13 +929,6 @@ struct McDSP16 {
 }  // namespace
 
 namespace dav1d {
-
-// Resolve the best per-target function pointers once at init; the
-// ChosenTarget must be initialized first or the tables yield their
-// re-dispatching first entry.
-static void hwy_init_chosen_target() {
-    hwy::GetChosenTarget().Update(hwy::SupportedTargets());
-}
 
 // w_mask[] order in Dav1dMCDSPContext: 444, 422, 420.
 static void mc_compound_dsp_init_8bpc_hwy(void *const c) {

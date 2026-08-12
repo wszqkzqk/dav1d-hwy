@@ -34,8 +34,8 @@
 
 #include "src/loopfilter.h"
 
-#if HAVE_HIGHWAY
 #include "src/cpu.h"
+#if HAVE_HIGHWAY
 #include "src/hwy_dsp.h"
 #endif
 

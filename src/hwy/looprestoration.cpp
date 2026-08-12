@@ -39,6 +39,7 @@
 #include "hwy/foreach_target.h"
 
 #include "hwy/highway.h"
+#include "src/hwy/common.h"
 
 // 1/x table for the SGR "z" values, defined in src/tables.c.
 extern "C" const uint8_t dav1d_sgr_x_by_x[256];
@@ -63,18 +64,6 @@ namespace dav1d {
 namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
-
-// Matches ulog2() in include/common/intops.h.
-static inline int hwy_ulog2(const unsigned v) {
-#if defined(_MSC_VER) && !defined(__clang__)
-    if (!v) return -1;
-    unsigned long idx;
-    _BitScanReverse(&idx, v);
-    return (int) idx;
-#else
-    return v ? 31 - __builtin_clz(v) : -1;
-#endif
-}
 
 // enum LrEdgeFlags in src/looprestoration.h.
 enum {
@@ -110,33 +99,6 @@ static inline hn::VFromD<D32> hwy_widen_i32(const D32 d32, const V v) {
     } else {
         const hn::Rebind<uint16_t, D32> du16;
         return hn::PromoteTo(d32, hn::PromoteTo(du16, v));
-    }
-}
-
-template <typename Pixel, class D32>
-static inline hn::VFromD<D32> hwy_load_px(const D32 d32, const Pixel *const p,
-                                          const int n)
-{
-    const hn::Rebind<Pixel, D32> dp;
-    const int L = (int) hn::Lanes(d32);
-    return hwy_widen_i32(d32, n >= L ? hn::LoadU(dp, p) : hn::LoadN(dp, p, n));
-}
-
-// Stores int32 lanes as pixels; the caller has clamped to [0, bitdepth_max],
-// so the narrowing demotions are exact.
-template <typename Pixel, class D32>
-static inline void hwy_store_px(Pixel *const p, const D32 d32,
-                                const hn::VFromD<D32> v, const int n)
-{
-    const hn::Rebind<Pixel, D32> dp;
-    const int L = (int) hn::Lanes(d32);
-    if constexpr (sizeof(Pixel) == 1) {
-        const hn::Rebind<uint16_t, D32> du16;
-        const auto v8 = hn::DemoteTo(dp, hn::DemoteTo(du16, v));
-        if (n >= L) hn::StoreU(v8, dp, p); else hn::StoreN(v8, dp, p, n);
-    } else {
-        const auto v16 = hn::DemoteTo(dp, v);
-        if (n >= L) hn::StoreU(v16, dp, p); else hn::StoreN(v16, dp, p, n);
     }
 }
 
@@ -253,7 +215,7 @@ static void hwy_wiener_filter_h(uint16_t *const dst, const Pixel (*left)[4],
 // Stores the [lo, hi] int32 pair as pixels; the caller has clamped to
 // [0, bitdepth_max], so the narrowing demotions are exact.
 template <typename Pixel, class D32>
-static inline void hwy_store_px2(Pixel *const p, const D32 d32,
+static inline void hwy_store_px2(Pixel *const p,
                                  const hn::VFromD<D32> lo,
                                  const hn::VFromD<D32> hi, const int n)
 {
@@ -301,7 +263,7 @@ static void hwy_wiener_filter_v_core(Pixel *const p,
                        vzero, vmax);
         hi = hn::Clamp(hn::ShiftRightSame(hn::Add(hi, voff), round_bits_v),
                        vzero, vmax);
-        hwy_store_px2(p + x, d32, lo, hi, w - x);
+        hwy_store_px2<Pixel, decltype(d32)>(p + x, lo, hi, w - x);
     }
 }
 
@@ -1707,13 +1669,6 @@ struct LrDSP16 {
 }  // namespace
 
 namespace dav1d {
-
-// Resolve the best per-target function pointers once at init; the
-// ChosenTarget must be initialized first or the tables yield their
-// re-dispatching first entry.
-static void hwy_init_chosen_target() {
-    hwy::GetChosenTarget().Update(hwy::SupportedTargets());
-}
 
 static void loop_restoration_dsp_init_8bpc_hwy(void *const c) {
     auto *const ctx = static_cast<LrDSP8 *>(c);

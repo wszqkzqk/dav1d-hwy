@@ -38,6 +38,7 @@
 #include "hwy/foreach_target.h"
 
 #include "hwy/highway.h"
+#include "src/hwy/common.h"
 
 #include "dav1d/headers.h" // Dav1dFilmGrainData (public header, C++-clean)
 
@@ -50,20 +51,6 @@ namespace dav1d {
 namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
-
-// Matches ulog2() in include/common/intops.h.
-static inline int hwy_ulog2(const unsigned v) {
-#if defined(_MSC_VER) && !defined(__clang__)
-    if (!v) return -1;
-    unsigned long idx;
-    _BitScanReverse(&idx, v);
-    return (int) idx;
-#else
-    return v ? 31 - __builtin_clz(v) : -1;
-#endif
-}
-
-static inline int hwy_imin(const int a, const int b) { return a < b ? a : b; }
 
 // entry (grain LUT element) type per pixel type (src/filmgrain.h): int8_t
 // for 8bpc, int16_t for 16bpc.
@@ -342,9 +329,8 @@ static void hwy_fg_noise_row(Pixel *const dst, const Pixel *const src,
     }
 }
 
-// The scaling LUT is indexed by the pixel value (up to 4096 entries), so the
-// lookup stays a scalar gather on every target; the arithmetic around it is
-// vectorized. n <= 32 (one FG block row, subsampled at most 16).
+// The scaling LUT is indexed by the pixel value (up to 4096 entries): a
+// scalar gather on any target. n <= 32 (one FG block row, subsampled at most 16).
 template <typename Pixel, typename Entry>
 static void hwy_fgy_row(Pixel *const dst, const Pixel *const src,
                         const Entry *const grain, const uint8_t *const scaling,
@@ -921,13 +907,6 @@ struct FgDSP16 {
 }  // namespace
 
 namespace dav1d {
-
-// Resolve the best per-target function pointers once at init; the
-// ChosenTarget must be initialized first or the tables yield their
-// re-dispatching first entry.
-static void hwy_init_chosen_target() {
-    hwy::GetChosenTarget().Update(hwy::SupportedTargets());
-}
 
 static void film_grain_dsp_init_8bpc_hwy(void *const c) {
     auto *const ctx = static_cast<FgDSP8 *>(c);

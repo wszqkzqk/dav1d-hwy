@@ -25,7 +25,7 @@
 // Intra predictors (src/ipred_tmpl.c) implemented with Google Highway: one
 // source is compiled per SIMD target and the best one supported by the CPU
 // is selected at runtime (HWY_DYNAMIC_DISPATCH). Bit-exact with the C code;
-// the cfl_ac/cfl_pred functions are not covered.
+// the cfl_ac/cfl_pred functions and 16bpc smooth_v are not covered.
 //
 // Compute vectors are 8 x int16 (128 bits); 32-bit math is done on
 // sequential half vectors (PromoteTo of Lower/UpperHalf), the same idiom as
@@ -40,6 +40,7 @@
 #include "hwy/foreach_target.h"
 
 #include "hwy/highway.h"
+#include "src/hwy/common.h"
 
 // Defined in src/tables.c.
 extern "C" const uint8_t dav1d_sm_weights[128];
@@ -53,24 +54,9 @@ namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
 
-// imin/imax/iclip match include/common/intops.h.
-static inline int hwy_imin(const int a, const int b) { return a < b ? a : b; }
-static inline int hwy_imax(const int a, const int b) { return a > b ? a : b; }
+// iclip matches include/common/intops.h.
 static inline int hwy_iclip(const int v, const int min, const int max) {
     return v < min ? min : v > max ? max : v;
-}
-static inline int hwy_iabs(const int v) { return v < 0 ? -v : v; }
-
-// Matches ctz() in include/common/intops.h. dc_gen() divides by ctz of sums
-// like 4+8 that are not powers of two, so ulog2 would not be equivalent.
-static inline int hwy_ctz(const unsigned v) {
-#if defined(_MSC_VER) && !defined(__clang__)
-    unsigned long idx;
-    _BitScanForward(&idx, v);
-    return (int) idx;
-#else
-    return __builtin_ctz(v);
-#endif
 }
 
 // Pixels never exceed 4095, so the u16 -> i16 bitcasts and the i16 -> pixel
@@ -121,25 +107,6 @@ static HWY_INLINE void StorePxN(const D16, Pixel *const p,
     } else {
         hn::StoreN(hn::BitCast(dp, v), dp, p, n);
     }
-}
-
-// i16 -> i32 of the sequential lower/upper half (column order).
-template <class D32, class V16>
-static HWY_INLINE hn::VFromD<D32> WidenLo(const D32 d32, const V16 v) {
-    return hn::PromoteTo(d32, hn::LowerHalf(v));
-}
-template <class D32, class V16>
-static HWY_INLINE hn::VFromD<D32> WidenHi(const D32 d32, const V16 v) {
-    return hn::PromoteUpperTo(d32, v);
-}
-
-// Packs i32 lo/hi half results back into i16 column order; the callers'
-// values are all in [0, 4095], so the saturating demote is exact.
-template <class D16, class V32>
-static HWY_INLINE hn::VFromD<D16> PackHalves(const D16 d, const V32 lo,
-                                             const V32 hi) {
-    const hn::Rebind<int16_t, hn::DFromV<V32>> dh;
-    return hn::Combine(d, hn::DemoteTo(dh, hi), hn::DemoteTo(dh, lo));
 }
 
 // Zero-extending variants for i16 lanes holding u16 values (the smooth
@@ -628,8 +595,7 @@ static unsigned hwy_dc_gen_top(const Pixel *const topleft, const int width) {
 template <typename Pixel>
 static unsigned hwy_dc_gen_left(const Pixel *const topleft, const int height) {
     unsigned dc = height >> 1;
-    // Forward memory order (addition is commutative): keeps the compiler's
-    // auto-vectorization of the sum cheap.
+    // Sums in forward memory order; exact (integer addition is commutative).
     for (int i = 0; i < height; i++)
         dc += topleft[i - height];
     return dc >> hwy_ctz(height);
@@ -663,9 +629,7 @@ static void hwy_splat_dc(Pixel *dst, const ptrdiff_t stride,
 {
     const ptrdiff_t pxstride = stride / (ptrdiff_t) sizeof(Pixel);
     if (width * (int) sizeof(Pixel) >= 64) {
-        // Wide rows are store-issue bound; 64-bit stores measure faster than
-        // 128-bit ones there (both bitdepths' block widths are powers of
-        // two, so no tail handling is needed).
+        // Block widths are powers of two, so no tail handling is needed.
         const uint64_t dcN = (uint64_t) dc *
             (sizeof(Pixel) == 1 ? 0x0101010101010101ULL : 0x0001000100010001ULL);
         constexpr int kPerStore = (int) (sizeof(uint64_t) / sizeof(Pixel));
@@ -1306,13 +1270,6 @@ struct IpredDSP16 {
 
 namespace dav1d {
 
-// Resolve the best per-target function pointers once at init; the
-// ChosenTarget must be initialized first or the tables yield their
-// re-dispatching first entry.
-static void hwy_init_chosen_target() {
-    hwy::GetChosenTarget().Update(hwy::SupportedTargets());
-}
-
 static void ipred_dsp_init_8bpc_hwy(void *const c) {
     auto *const ctx = static_cast<IpredDSP8 *>(c);
     ctx->intra_pred[0]  = HWY_DYNAMIC_POINTER(ipred_dc_8bpc);
@@ -1340,9 +1297,7 @@ static void ipred_dsp_init_16bpc_hwy(void *const c) {
     ctx->intra_pred[7]  = HWY_DYNAMIC_POINTER(ipred_z2_16bpc);
     ctx->intra_pred[8]  = HWY_DYNAMIC_POINTER(ipred_z3_16bpc);
     ctx->intra_pred[9]  = HWY_DYNAMIC_POINTER(ipred_smooth_16bpc);
-    /* smooth_v stays C: clang auto-vectorizes the C inner loop to widening
-     * multiply-accumulate NEON code running at store bandwidth; the portable
-     * i32-halves form measures ~0.7x at large sizes. */
+    // 16bpc smooth_v is not covered (slot 10 keeps the C function).
     ctx->intra_pred[11] = HWY_DYNAMIC_POINTER(ipred_smooth_h_16bpc);
     ctx->intra_pred[12] = HWY_DYNAMIC_POINTER(ipred_paeth_16bpc);
     ctx->intra_pred[13] = HWY_DYNAMIC_POINTER(ipred_filter_16bpc);

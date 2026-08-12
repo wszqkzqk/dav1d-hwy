@@ -996,10 +996,9 @@ COLD void bitfn(dav1d_mc_dsp_init)(Dav1dMCDSPContext *const c) {
     c->resize   = resize_c;
 
 #if HAVE_HIGHWAY
-    /* Portable SIMD put/prep kernels, dispatched at runtime to the best SIMD
-     * target; the asm init below still takes precedence where it exists.
-     * Skipped when all cpu flags are masked off (checkasm's C reference
-     * pass). */
+    /* Portable SIMD versions, dispatched at runtime to the best SIMD target;
+     * the asm init below still takes precedence where it exists. Skipped when
+     * all cpu flags are masked off (checkasm's C reference pass). */
 #if HAVE_ASM
     if (dav1d_get_cpu_flags())
 #endif

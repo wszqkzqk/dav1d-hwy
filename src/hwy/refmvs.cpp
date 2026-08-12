@@ -39,6 +39,7 @@
 #include "hwy/foreach_target.h"
 
 #include "hwy/highway.h"
+#include "src/hwy/common.h"
 
 // Block width/height in 4x4 units, defined in src/tables.c.
 extern "C" const uint8_t dav1d_block_dimensions[][4];
@@ -224,13 +225,6 @@ struct RefmvsDSP {
 }  // namespace
 
 namespace dav1d {
-
-// Resolve the best per-target function pointers once at init; the
-// ChosenTarget must be initialized first or the tables yield their
-// re-dispatching first entry.
-static void hwy_init_chosen_target() {
-    hwy::GetChosenTarget().Update(hwy::SupportedTargets());
-}
 
 static void refmvs_dsp_init_hwy(void *const c) {
     auto *const ctx = static_cast<RefmvsDSP *>(c);

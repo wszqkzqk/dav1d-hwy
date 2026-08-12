@@ -38,6 +38,7 @@
 #include "hwy/foreach_target.h"
 
 #include "hwy/highway.h"
+#include "src/hwy/common.h"
 
 // Flattened (y * 12 + x) neighbour offsets, defined in src/tables.c.
 extern "C" const int8_t dav1d_cdef_directions[12][2];
@@ -48,20 +49,6 @@ namespace dav1d {
 namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
-
-// Matches ulog2() in include/common/intops.h.
-static inline int hwy_ulog2(const unsigned v) {
-#if defined(_MSC_VER) && !defined(__clang__)
-    if (!v) return -1;
-    unsigned long idx;
-    _BitScanReverse(&idx, v);
-    return (int) idx;
-#else
-    return v ? 31 - __builtin_clz(v) : -1;
-#endif
-}
-
-static inline int hwy_imax(const int a, const int b) { return a > b ? a : b; }
 
 // enum CdefEdgeFlags in src/cdef.h.
 enum {
@@ -391,8 +378,8 @@ CDEF_FILTER_FN(4, 4, 16, 16bpc)
 //   dir 2: per-row sums;          dir 6: column sums.
 
 // bins[k] += row_i[k - i], with row_i produced by row(i); bins must be
-// zeroed by the caller (16 entries, only R + W - 1 used). RowFn rather than
-// a vector array: RVV vector types are sizeless.
+// zeroed by the caller (16 entries, only R + W - 1 used). RowFn callback:
+// RVV vector types are sizeless, so a vector array is impossible.
 template <class D, class RowFn>
 static inline void cdef_diag_bins(const D d, RowFn&& row, const int R,
                                   const int W, int16_t *const bins)
@@ -555,13 +542,6 @@ struct CdefDSP16 {
 }  // namespace
 
 namespace dav1d {
-
-// Resolve the best per-target function pointers once at init; the
-// ChosenTarget must be initialized first or the tables yield their
-// re-dispatching first entry.
-static void hwy_init_chosen_target() {
-    hwy::GetChosenTarget().Update(hwy::SupportedTargets());
-}
 
 static void cdef_dsp_init_8bpc_hwy(void *const c) {
     auto *const ctx = static_cast<CdefDSP8 *>(c);

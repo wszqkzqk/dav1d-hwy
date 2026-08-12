@@ -33,6 +33,7 @@
 #include "hwy/foreach_target.h"
 
 #include "hwy/highway.h"
+#include "src/hwy/common.h"
 
 // Mirror of Av1FilterLUT (src/lf_mask.h); member ALIGN(16) does not change
 // the offsets (e @ 0, i @ 64, sharp @ 128). Guarded: this file is re-included
@@ -52,18 +53,6 @@ namespace dav1d {
 namespace HWY_NAMESPACE {
 
 namespace hn = hwy::HWY_NAMESPACE;
-
-// Matches ulog2() in include/common/intops.h.
-static inline int hwy_ulog2(const unsigned v) {
-#if defined(_MSC_VER) && !defined(__clang__)
-    if (!v) return -1;
-    unsigned long idx;
-    _BitScanReverse(&idx, v);
-    return (int) idx;
-#else
-    return v ? 31 - __builtin_clz(v) : -1;
-#endif
-}
 
 // One loop_filter() call from src/loopfilter_tmpl.c: filters 4 pixels along
 // the edge normal (the "taps"), for 4 independent edge positions (the lanes).
@@ -105,9 +94,7 @@ static void hwy_loop_filter4(Pixel *const dst, const ptrdiff_t lane_stride,
     // be loaded once with full vector loads and transposed in registers into
     // per-tap vectors; modified taps are queued back and flushed through the
     // inverse transpose. Cols -8/+7 beyond the C footprint are read but never
-    // written (the arch asm loads full vectors the same way). Measured on
-    // arm64 NEON this pays off only for 16bpc; 8bpc (and other targets) use
-    // per-lane scalar access like the C code.
+    // written (the arch asm loads full vectors the same way).
     constexpr bool kUseTranspose = !kLanesContig && sizeof(Pixel) == 2 &&
                                    HWY_LANES(int16_t) == 8;
     [[maybe_unused]] V taps[16];  // column k at index k + 8
@@ -637,13 +624,6 @@ struct LfDSP16 {
 }  // namespace
 
 namespace dav1d {
-
-// Resolve the best per-target function pointers once at init; the
-// ChosenTarget must be initialized first or the tables yield their
-// re-dispatching first entry.
-static void hwy_init_chosen_target() {
-    hwy::GetChosenTarget().Update(hwy::SupportedTargets());
-}
 
 static void loop_filter_dsp_init_8bpc_hwy(void *const c) {
     auto *const ctx = static_cast<LfDSP8 *>(c);

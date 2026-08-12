@@ -37,6 +37,7 @@
 #include "hwy/foreach_target.h"
 
 #include "hwy/highway.h"
+#include "src/hwy/common.h"
 
 HWY_BEFORE_NAMESPACE();
 
@@ -175,13 +176,6 @@ struct PalDSP {
 }  // namespace
 
 namespace dav1d {
-
-// Resolve the best per-target function pointers once at init; the
-// ChosenTarget must be initialized first or the tables yield their
-// re-dispatching first entry.
-static void hwy_init_chosen_target() {
-    hwy::GetChosenTarget().Update(hwy::SupportedTargets());
-}
 
 static void pal_dsp_init_hwy(void *const c) {
     auto *const ctx = static_cast<PalDSP *>(c);
