@@ -1003,7 +1003,10 @@ COLD void bitfn(dav1d_mc_dsp_init)(Dav1dMCDSPContext *const c) {
 #if HAVE_ASM
     if (dav1d_get_cpu_flags())
 #endif
+    {
         bitfn(dav1d_mc_dsp_init_hwy)(c);
+        bitfn(dav1d_mc_compound_dsp_init_hwy)(c);
+    }
 #endif
 
 #if HAVE_ASM
